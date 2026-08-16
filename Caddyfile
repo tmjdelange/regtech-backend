@@ -1,0 +1,3 @@
+api.thedataqualitycompany.com {
+    reverse_proxy backend:8000
+}
