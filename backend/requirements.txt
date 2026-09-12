@@ -5,3 +5,6 @@ psycopg2-binary
 pgvector
 alembic
 openai
+python-multipart
+pytest
+httpx

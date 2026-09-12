@@ -10,3 +10,6 @@ class Document(Base):
     content = Column(String, nullable=False)
     embedding = Column(Vector(1536))  # 1536 = OpenAI/most common embedding size; adjust to whatever model you use
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    country = Column(String, nullable=True)
+    category = Column(String, nullable=True)
+    source_url = Column(String, nullable=True)
