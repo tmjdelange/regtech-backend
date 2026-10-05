@@ -15,7 +15,7 @@ services:
     depends_on:
       - db
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     # no ports here anymore — only Caddy talks to it, over the internal Docker network
 
   caddy:
