@@ -56,6 +56,39 @@ def client():
     return TestClient(app)
 
 
+def test_health(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def test_create_document_requires_auth(client):
+    resp = client.post("/documents", json={"content": "test doc"})
+    assert resp.status_code == 422  # missing header entirely
+
+
+def test_create_document_rejects_wrong_key(client):
+    resp = client.post(
+        "/documents",
+        json={"content": "test doc"},
+        headers={"x-api-key": "wrong-key"},
+    )
+    assert resp.status_code == 401  # header present, but invalid
+
+
+def test_search_requires_auth(client):
+    resp = client.get("/documents/search?query=test")
+    assert resp.status_code == 422  # missing header entirely
+
+
+def test_search_rejects_wrong_key(client):
+    resp = client.get(
+        "/documents/search?query=test",
+        headers={"x-api-key": "wrong-key"},
+    )
+    assert resp.status_code == 401  # header present, but invalid
+
+
 def test_bulk_upload_requires_admin_key(client, fake_db, mock_embeddings):
     csv_bytes = b"content\nSome content\n"
     files = {"file": ("docs.csv", csv_bytes, "text/csv")}
