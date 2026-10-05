@@ -133,6 +133,25 @@ def test_bulk_upload_csv_success(client, fake_db, mock_embeddings):
     assert mock_embeddings.call_count == 2
 
 
+def test_bulk_upload_saves_title(client, fake_db, mock_embeddings):
+    csv_bytes = (
+        b"country,category,title,content,source_url\n"
+        b"US,tax,Title A,Some regulatory content A,https://example.com/a\n"
+    )
+    files = {"file": ("docs.csv", csv_bytes, "text/csv")}
+
+    resp = client.post(
+        "/admin/documents/bulk",
+        headers={"x-api-key": ADMIN_API_KEY},
+        files=files,
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"inserted": 1, "skipped": []}
+    assert len(fake_db.added) == 1
+    assert fake_db.added[0].title == "Title A"
+
+
 def test_bulk_upload_json_success(client, fake_db, mock_embeddings):
     rows = [
         {

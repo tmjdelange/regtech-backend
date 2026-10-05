@@ -3,6 +3,7 @@ from typing import List, Optional
 
 class DocumentCreate(BaseModel):
     content: str
+    title: Optional[str] = None
     country: Optional[str] = None
     category: Optional[str] = None
     source_url: Optional[str] = None
@@ -10,6 +11,7 @@ class DocumentCreate(BaseModel):
 class DocumentOut(BaseModel):
     id: int
     content: str
+    title: Optional[str] = None
     country: Optional[str] = None
     category: Optional[str] = None
     source_url: Optional[str] = None

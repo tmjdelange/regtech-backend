@@ -34,6 +34,7 @@ def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
     db_doc = Document(
         content=doc.content,
         embedding=embedding,
+        title=doc.title,
         country=doc.country,
         category=doc.category,
         source_url=doc.source_url,
@@ -107,6 +108,7 @@ async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depe
         db_doc = Document(
             content=content,
             embedding=embedding,
+            title=row.get("title") or None,
             country=row.get("country") or None,
             category=row.get("category") or None,
             source_url=row.get("source_url") or None,
