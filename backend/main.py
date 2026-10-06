@@ -8,7 +8,14 @@ from openai import OpenAI
 
 from database import get_db
 from models import Document
-from schemas import DocumentCreate, DocumentOut, SearchResult
+from schemas import (
+    DocumentCreate,
+    DocumentOut,
+    SearchResult,
+    AdminSearchResult,
+    AdminDocumentOut,
+    VerifiedUpdate,
+)
 from auth import verify_api_key, verify_admin_key
 
 app = FastAPI()
@@ -38,6 +45,7 @@ def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
         country=doc.country,
         category=doc.category,
         source_url=doc.source_url,
+        verified=False,
     )
     db.add(db_doc)
     db.commit()
@@ -58,7 +66,7 @@ def search_documents(
         Document.id,
         Document.content,
         Document.embedding.cosine_distance(query_embedding).label("distance"),
-    )
+    ).filter(Document.verified == True)
     if country is not None:
         q = q.filter(Document.country == country)
     if category is not None:
@@ -112,9 +120,61 @@ async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depe
             country=row.get("country") or None,
             category=row.get("category") or None,
             source_url=row.get("source_url") or None,
+            verified=False,  # always unverified on bulk import, regardless of any "verified" value in the file
         )
         db.add(db_doc)
         inserted += 1
 
     db.commit()
     return {"inserted": inserted, "skipped": skipped}
+
+
+@app.get("/admin/documents/search", response_model=list[AdminSearchResult], dependencies=[Depends(verify_admin_key)])
+def admin_search_documents(
+    query: str,
+    limit: int = 5,
+    country: str | None = None,
+    category: str | None = None,
+    verified: bool | None = None,
+    db: Session = Depends(get_db),
+):
+    query_embedding = get_embedding(query)
+    q = db.query(
+        Document.id,
+        Document.content,
+        Document.verified,
+        Document.embedding.cosine_distance(query_embedding).label("distance"),
+    )
+    if country is not None:
+        q = q.filter(Document.country == country)
+    if category is not None:
+        q = q.filter(Document.category == category)
+    if verified is not None:
+        q = q.filter(Document.verified == verified)
+    results = q.order_by("distance").limit(limit).all()
+    return [
+        AdminSearchResult(id=r.id, content=r.content, distance=r.distance, verified=r.verified)
+        for r in results
+    ]
+
+
+@app.get("/admin/documents", response_model=list[AdminDocumentOut], dependencies=[Depends(verify_admin_key)])
+def list_admin_documents(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    return (
+        db.query(Document)
+        .order_by(Document.id)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+
+@app.patch("/admin/documents/{document_id}/verified", response_model=AdminDocumentOut, dependencies=[Depends(verify_admin_key)])
+def update_document_verified(document_id: int, payload: VerifiedUpdate, db: Session = Depends(get_db)):
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    doc.verified = payload.verified
+    db.commit()
+    db.refresh(doc)
+    return doc

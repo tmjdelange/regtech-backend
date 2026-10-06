@@ -1,5 +1,5 @@
-from sqlalchemy import Column, Integer, String, DateTime
-from sqlalchemy.sql import func
+from sqlalchemy import Column, Integer, String, DateTime, Boolean
+from sqlalchemy.sql import func, false
 from pgvector.sqlalchemy import Vector
 from database import Base
 
@@ -14,3 +14,4 @@ class Document(Base):
     category = Column(String, nullable=True)
     source_url = Column(String, nullable=True)
     title = Column(String, nullable=True)
+    verified = Column(Boolean, nullable=False, server_default=false())
