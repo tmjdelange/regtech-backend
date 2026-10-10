@@ -390,3 +390,385 @@ def test_bulk_upload_embeds_title_and_content(client, fake_db, mock_embeddings):
 
     assert resp.status_code == 200
     assert mock_embeddings.call_args.args[0] == "Row Title\nRow content"
+
+
+# --- Checklist: rules/uk_beverages.json + checklist.py ---
+
+SDIL_SCOPE_TITLE = "Soft Drinks Industry Levy — scope and rates"
+SDIL_EXEMPTION_TITLE = "Soft Drinks Industry Levy — small producer exemption"
+FBO_TITLE = "UK Food Business Operator (FBO) address requirement"
+EORI_TITLE = "EORI number required to import into the UK"
+LABEL_TITLE = "Mandatory label information under UK FIC (Food Information for Consumers)"
+ORIGIN_TITLE = "Rules of Origin for tariff-free UK-EU trade"
+INVOICE_TITLE = "Commercial invoice requirements for UK customs clearance"
+
+ALL_CHECKLIST_TITLES = [
+    SDIL_SCOPE_TITLE,
+    SDIL_EXEMPTION_TITLE,
+    FBO_TITLE,
+    EORI_TITLE,
+    LABEL_TITLE,
+    ORIGIN_TITLE,
+    INVOICE_TITLE,
+]
+
+
+def _seed_checklist_documents(fake_db, *, skip_titles=(), unverified_titles=()):
+    """Seed every document the checklist rules cite, verified by default.
+    `skip_titles` omits a document entirely (as if it were never uploaded);
+    `unverified_titles` seeds it but with verified=False."""
+    for i, title in enumerate(ALL_CHECKLIST_TITLES, start=100):
+        if title in skip_titles:
+            continue
+        _seed_document(
+            fake_db,
+            id=i,
+            title=title,
+            content=f"Content for {title}",
+            source_url=f"https://example.com/{i}",
+            verified=title not in unverified_titles,
+        )
+
+
+def _checklist_profile(**overrides):
+    profile = dict(
+        abv_percent=0.5,
+        added_sugar_g_per_100ml=0.0,
+        annual_volume="unknown",
+        uk_importer="not_decided",
+        label_uk_address="unknown",
+        importer_has_eori="unknown",
+        origin_proof="unknown",
+        invoice_ready="unknown",
+        label_elements=["english_name", "ingredients_list_with_allergens", "origin_statement"],
+    )
+    profile.update(overrides)
+    return profile
+
+
+def _evaluate_checklist(client, profile, *, admin=False):
+    path = "/admin/checklist/evaluate" if admin else "/checklist/evaluate"
+    key = ADMIN_API_KEY if admin else API_KEY
+    return client.post(path, headers={"x-api-key": key}, json=profile)
+
+
+def _items_by_id(body):
+    return {item["id"]: item for item in body["items"]}
+
+
+def test_checklist_evaluate_requires_auth(client):
+    resp = client.post("/checklist/evaluate", json=_checklist_profile())
+    assert resp.status_code == 422  # missing header entirely
+
+
+def test_checklist_evaluate_rejects_wrong_key(client):
+    resp = client.post(
+        "/checklist/evaluate",
+        headers={"x-api-key": "wrong-key"},
+        json=_checklist_profile(),
+    )
+    assert resp.status_code == 401
+
+
+def test_admin_checklist_evaluate_rejects_regular_api_key(client, fake_db):
+    resp = _evaluate_checklist(client, _checklist_profile(), admin=False)
+    # sanity: the public call with the regular key succeeds...
+    assert resp.status_code == 200
+    # ...but the admin endpoint rejects that same regular key.
+    resp = client.post(
+        "/admin/checklist/evaluate",
+        headers={"x-api-key": API_KEY},
+        json=_checklist_profile(),
+    )
+    assert resp.status_code == 401
+
+
+def test_checklist_out_of_scope_above_1_2_abv(client, fake_db):
+    resp = _evaluate_checklist(client, _checklist_profile(abv_percent=1.3))
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "message": (
+            "This checker covers drinks up to 1.2% ABV. Higher-ABV drinks "
+            "fall under different rules that aren't covered here."
+        )
+    }
+
+
+def test_checklist_in_scope_at_exactly_1_2_abv(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(client, _checklist_profile(abv_percent=1.2))
+    assert resp.status_code == 200
+    assert "items" in resp.json()
+
+
+def test_checklist_sdil_below_threshold_not_applicable(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(client, _checklist_profile(added_sugar_g_per_100ml=4.9))
+    body = resp.json()
+    assert _items_by_id(body)["sdil"]["status"] == "not_applicable"
+
+
+def test_checklist_sdil_lower_band_large_volume_action_needed(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(added_sugar_g_per_100ml=6.0, annual_volume="1m_or_more"),
+    )
+    item = _items_by_id(resp.json())["sdil"]
+    assert item["status"] == "action_needed"
+    assert "lower rate" in item["action"]
+
+
+def test_checklist_sdil_higher_band_small_volume_confirm(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(added_sugar_g_per_100ml=8.0, annual_volume="under_1m"),
+    )
+    item = _items_by_id(resp.json())["sdil"]
+    assert item["status"] == "confirm"
+    assert "higher rate" in item["action"]
+
+
+def test_checklist_fbo_no_importer_action_needed(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(client, _checklist_profile(uk_importer="no"))
+    assert _items_by_id(resp.json())["fbo"]["status"] == "action_needed"
+
+
+def test_checklist_fbo_not_decided_action_needed(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(client, _checklist_profile(uk_importer="not_decided"))
+    assert _items_by_id(resp.json())["fbo"]["status"] == "action_needed"
+
+
+def test_checklist_fbo_importer_yes_no_address_action_needed(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client, _checklist_profile(uk_importer="yes", label_uk_address="no")
+    )
+    assert _items_by_id(resp.json())["fbo"]["status"] == "action_needed"
+
+
+def test_checklist_fbo_importer_yes_address_unknown_confirm(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client, _checklist_profile(uk_importer="yes", label_uk_address="unknown")
+    )
+    assert _items_by_id(resp.json())["fbo"]["status"] == "confirm"
+
+
+def test_checklist_fbo_importer_yes_address_yes_covered(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client, _checklist_profile(uk_importer="yes", label_uk_address="yes")
+    )
+    assert _items_by_id(resp.json())["fbo"]["status"] == "covered"
+
+
+@pytest.mark.parametrize(
+    "field, rule_id",
+    [
+        ("importer_has_eori", "eori"),
+        ("origin_proof", "origin_proof"),
+        ("invoice_ready", "invoice"),
+    ],
+)
+@pytest.mark.parametrize(
+    "value, expected_status",
+    [("no", "action_needed"), ("unknown", "confirm"), ("yes", "covered")],
+)
+def test_checklist_simple_yes_no_unknown_rules(
+    client, fake_db, field, rule_id, value, expected_status
+):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(client, _checklist_profile(**{field: value}))
+    assert _items_by_id(resp.json())[rule_id]["status"] == expected_status
+
+
+def test_checklist_label_elements_missing_english_name_action_needed(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(
+            label_elements=["ingredients_list_with_allergens", "origin_statement"]
+        ),
+    )
+    item = _items_by_id(resp.json())["label_elements"]
+    assert item["status"] == "action_needed"
+    assert "English name" in item["action"]
+
+
+def test_checklist_label_elements_only_origin_missing_confirm(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(
+            label_elements=["english_name", "ingredients_list_with_allergens"]
+        ),
+    )
+    assert _items_by_id(resp.json())["label_elements"]["status"] == "confirm"
+
+
+def test_checklist_label_elements_all_present_covered(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(
+            label_elements=[
+                "english_name",
+                "ingredients_list_with_allergens",
+                "origin_statement",
+            ]
+        ),
+    )
+    assert _items_by_id(resp.json())["label_elements"]["status"] == "covered"
+
+
+def test_checklist_unknown_answers_never_produce_covered(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(
+            added_sugar_g_per_100ml=6.0,
+            annual_volume="unknown",
+            uk_importer="yes",
+            label_uk_address="unknown",
+            importer_has_eori="unknown",
+            origin_proof="unknown",
+            invoice_ready="unknown",
+        ),
+    )
+    items = _items_by_id(resp.json())
+    # label_elements and sdil have no "unknown" input of their own, so they're
+    # outside the scope of this guard; everything driven by an "unknown"
+    # answer must not be "covered".
+    for rule_id in ("fbo", "eori", "origin_proof", "invoice"):
+        assert items[rule_id]["status"] != "covered"
+        assert items[rule_id]["status"] == "confirm"
+
+
+def test_checklist_headline_never_contains_forbidden_words(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    profiles = [
+        _checklist_profile(),
+        _checklist_profile(
+            added_sugar_g_per_100ml=10,
+            annual_volume="1m_or_more",
+            uk_importer="yes",
+            label_uk_address="yes",
+            importer_has_eori="yes",
+            origin_proof="yes",
+            invoice_ready="yes",
+        ),
+        _checklist_profile(
+            uk_importer="no",
+            label_uk_address="no",
+            importer_has_eori="no",
+            origin_proof="no",
+            invoice_ready="no",
+        ),
+    ]
+    for profile in profiles:
+        resp = _evaluate_checklist(client, profile)
+        headline = resp.json()["headline"].lower()
+        for forbidden in ("compliant", "certified", "ready"):
+            assert forbidden not in headline
+
+
+def test_checklist_rule_skipped_when_source_unverified_public_vs_admin(client, fake_db):
+    _seed_checklist_documents(fake_db, unverified_titles=[EORI_TITLE])
+    profile = _checklist_profile(importer_has_eori="no")
+
+    public_resp = _evaluate_checklist(client, profile, admin=False)
+    public_ids = _items_by_id(public_resp.json())
+    assert "eori" not in public_ids
+    # the other rules, with verified sources, still come through
+    assert "fbo" in public_ids
+
+    admin_resp = _evaluate_checklist(client, profile, admin=True)
+    admin_ids = _items_by_id(admin_resp.json())
+    assert "eori" in admin_ids
+    assert admin_ids["eori"]["reviewed"] is False
+    assert admin_ids["fbo"]["reviewed"] is True
+
+
+def test_checklist_rule_skipped_entirely_when_source_document_missing(client, fake_db):
+    # Not just unverified - never uploaded at all. Must be skipped even by
+    # the admin endpoint, since there's no excerpt/url to show for it.
+    _seed_checklist_documents(fake_db, skip_titles=[EORI_TITLE])
+    profile = _checklist_profile()
+
+    for admin in (False, True):
+        resp = _evaluate_checklist(client, profile, admin=admin)
+        assert "eori" not in _items_by_id(resp.json())
+
+
+def test_checklist_sdil_skipped_when_one_of_two_sources_missing(client, fake_db):
+    _seed_checklist_documents(fake_db, skip_titles=[SDIL_EXEMPTION_TITLE])
+    profile = _checklist_profile(added_sugar_g_per_100ml=6.0)
+
+    for admin in (False, True):
+        resp = _evaluate_checklist(client, profile, admin=admin)
+        assert "sdil" not in _items_by_id(resp.json())
+
+
+def test_checklist_items_ordered_action_needed_confirm_covered_not_applicable(
+    client, fake_db
+):
+    _seed_checklist_documents(fake_db)
+    resp = _evaluate_checklist(
+        client,
+        _checklist_profile(
+            uk_importer="yes",
+            label_uk_address="no",
+            origin_proof="no",
+            invoice_ready="no",
+            importer_has_eori="unknown",
+            annual_volume="under_1m",
+            added_sugar_g_per_100ml=6.0,
+        ),
+    )
+    statuses = [item["status"] for item in resp.json()["items"]]
+    order = {"action_needed": 0, "confirm": 1, "covered": 2, "not_applicable": 3}
+    assert statuses == sorted(statuses, key=lambda s: order[s])
+
+
+def test_checklist_scenario_from_brief(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    profile = _checklist_profile(
+        abv_percent=0.4,
+        added_sugar_g_per_100ml=6.5,
+        annual_volume="under_1m",
+        uk_importer="yes",
+        label_uk_address="no",
+        importer_has_eori="unknown",
+        origin_proof="no",
+        invoice_ready="no",
+    )
+    resp = _evaluate_checklist(client, profile)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body["headline"] == (
+        "Based on your answers: 3 actions needed, 2 points to confirm, "
+        "in the 1 checks covered."
+    )
+
+    items = _items_by_id(body)
+    assert items["fbo"]["status"] == "action_needed"
+    assert items["origin_proof"]["status"] == "action_needed"
+    assert items["invoice"]["status"] == "action_needed"
+    assert items["sdil"]["status"] == "confirm"
+    assert items["eori"]["status"] == "confirm"
+    assert items["label_elements"]["status"] == "covered"
+
+    assert [item["id"] for item in body["items"]] == [
+        "fbo",
+        "origin_proof",
+        "invoice",
+        "sdil",
+        "eori",
+        "label_elements",
+    ]
+    assert all(item["reviewed"] is True for item in body["items"])

@@ -1,0 +1,83 @@
+{
+  "scope_max_abv_percent": 1.2,
+  "scope_stop_message": "This checker covers drinks up to 1.2% ABV. Higher-ABV drinks fall under different rules that aren't covered here.",
+  "scope_description": "Checks UK import basics for soft drinks at or below 1.2% ABV: the Soft Drinks Industry Levy, UK Food Business Operator address, EORI registration, mandatory label information, proof of origin, and commercial invoice readiness.",
+  "disclaimer": "This is general guidance based on the cited government sources, not legal advice. Confirm your specific situation with HMRC or a customs specialist before relying on it.",
+  "rules": [
+    {
+      "id": "sdil",
+      "sources": [
+        "Soft Drinks Industry Levy — scope and rates",
+        "Soft Drinks Industry Levy — small producer exemption"
+      ],
+      "primary_source": "Soft Drinks Industry Levy — scope and rates",
+      "thresholds": {
+        "lower_band_min_g_per_100ml": 5,
+        "higher_band_min_g_per_100ml": 8
+      },
+      "text": {
+        "band_lower": "lower rate",
+        "band_higher": "higher rate",
+        "not_applicable": "Added sugar is below {lower_band_min_g_per_100ml}g per 100ml, so the Soft Drinks Industry Levy does not apply to this product.",
+        "action_needed": "This product falls in the {band} Soft Drinks Industry Levy band (added sugar of {sugar}g per 100ml). Since you import {annual_volume_desc} annually, SDIL registration is likely required.",
+        "confirm": "This product falls in the {band} Soft Drinks Industry Levy band (added sugar of {sugar}g per 100ml). The small-producer exemption is based on production volume, and whether it applies to an importer bringing in someone else's product needs confirming with HMRC."
+      }
+    },
+    {
+      "id": "fbo",
+      "sources": ["UK Food Business Operator (FBO) address requirement"],
+      "primary_source": "UK Food Business Operator (FBO) address requirement",
+      "text": {
+        "action_needed_no_importer": "Appoint a UK-based importer or distributor to act as the Food Business Operator, or establish a UK entity, before placing this product on the UK market.",
+        "action_needed_no_address": "The label does not show a UK Food Business Operator address. Add the UK importer's or distributor's name and address to the label.",
+        "confirm_address_unknown": "Confirm whether the label shows a UK Food Business Operator name and address, as required once you have a UK importer.",
+        "covered": "The label shows a UK Food Business Operator address, as required."
+      }
+    },
+    {
+      "id": "eori",
+      "sources": ["EORI number required to import into the UK"],
+      "primary_source": "EORI number required to import into the UK",
+      "text": {
+        "action_needed": "Apply for an EORI number before importing into the UK; it's required for customs clearance.",
+        "confirm": "Confirm that your importer has a valid EORI number before the shipment reaches UK customs.",
+        "covered": "Your importer has an EORI number, as required for customs clearance."
+      }
+    },
+    {
+      "id": "label_elements",
+      "sources": ["Mandatory label information under UK FIC (Food Information for Consumers)"],
+      "primary_source": "Mandatory label information under UK FIC (Food Information for Consumers)",
+      "element_labels": {
+        "english_name": "the product's English name",
+        "ingredients_list_with_allergens": "an ingredients list with allergens highlighted",
+        "origin_statement": "an origin statement"
+      },
+      "text": {
+        "action_needed": "Add the following required label information: {missing}.",
+        "confirm": "Confirm whether an origin statement is required for this product; the source lists it as required \"where applicable\".",
+        "covered": "The label includes the English name, an ingredients list with allergens highlighted, and an origin statement."
+      }
+    },
+    {
+      "id": "origin_proof",
+      "sources": ["Rules of Origin for tariff-free UK-EU trade"],
+      "primary_source": "Rules of Origin for tariff-free UK-EU trade",
+      "text": {
+        "action_needed": "Obtain proof of origin for this product to qualify for tariff-free treatment under the UK-EU trade agreement.",
+        "confirm": "Confirm that proof of origin will be available for this shipment to qualify for tariff-free treatment.",
+        "covered": "Proof of origin is available for this product."
+      }
+    },
+    {
+      "id": "invoice",
+      "sources": ["Commercial invoice requirements for UK customs clearance"],
+      "primary_source": "Commercial invoice requirements for UK customs clearance",
+      "text": {
+        "action_needed": "Prepare a commercial invoice that includes: EORI numbers for both sender and buyer, tariff/commodity codes, country of origin, Incoterms, and any relevant certifications.",
+        "confirm": "Confirm the commercial invoice will include: EORI numbers for both sender and buyer, tariff/commodity codes, country of origin, Incoterms, and any relevant certifications.",
+        "covered": "The commercial invoice includes EORI numbers for both sender and buyer, tariff/commodity codes, country of origin, Incoterms, and relevant certifications."
+      }
+    }
+  ]
+}

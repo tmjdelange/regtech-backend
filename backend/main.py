@@ -1,9 +1,12 @@
 import csv
 import io
 import json
+from pathlib import Path
+
 from fastapi import FastAPI, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
+import checklist
 from database import get_db
 from embeddings import embedding_text, get_embedding
 from models import Document
@@ -14,12 +17,34 @@ from schemas import (
     AdminSearchResult,
     AdminDocumentOut,
     VerifiedUpdate,
+    ChecklistProfile,
+    ChecklistResponse,
 )
 from auth import verify_api_key, verify_admin_key
 
 app = FastAPI()
 
 DEFAULT_MAX_DISTANCE = 0.7
+
+with (Path(__file__).parent / "rules" / "uk_beverages.json").open(encoding="utf-8") as f:
+    CHECKLIST_RULES = json.load(f)
+
+_CHECKLIST_SOURCE_TITLES = sorted(
+    {title for rule in CHECKLIST_RULES["rules"] for title in rule["sources"]}
+)
+
+
+def _fetch_checklist_documents(db: Session) -> dict:
+    documents = {}
+    for title in _CHECKLIST_SOURCE_TITLES:
+        row = db.query(Document).filter(Document.title == title).first()
+        if row is not None:
+            documents[title] = {
+                "source_url": row.source_url,
+                "content": row.content,
+                "verified": row.verified,
+            }
+    return documents
 
 
 @app.get("/health")
@@ -179,3 +204,21 @@ def update_document_verified(document_id: int, payload: VerifiedUpdate, db: Sess
     db.commit()
     db.refresh(doc)
     return doc
+
+
+@app.post("/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_api_key)])
+def evaluate_checklist(profile: ChecklistProfile, db: Session = Depends(get_db)):
+    profile_dict = profile.model_dump()
+    if checklist.is_out_of_scope(CHECKLIST_RULES, profile_dict):
+        return checklist.out_of_scope_response(CHECKLIST_RULES)
+    documents = _fetch_checklist_documents(db)
+    return checklist.evaluate(CHECKLIST_RULES, profile_dict, documents, include_unverified=False)
+
+
+@app.post("/admin/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_admin_key)])
+def evaluate_checklist_admin(profile: ChecklistProfile, db: Session = Depends(get_db)):
+    profile_dict = profile.model_dump()
+    if checklist.is_out_of_scope(CHECKLIST_RULES, profile_dict):
+        return checklist.out_of_scope_response(CHECKLIST_RULES)
+    documents = _fetch_checklist_documents(db)
+    return checklist.evaluate(CHECKLIST_RULES, profile_dict, documents, include_unverified=True)
