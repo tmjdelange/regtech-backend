@@ -1,12 +1,11 @@
 import csv
 import io
 import json
-import os
 from fastapi import FastAPI, Depends, File, HTTPException, UploadFile
 from sqlalchemy.orm import Session
-from openai import OpenAI
 
 from database import get_db
+from embeddings import embedding_text, get_embedding
 from models import Document
 from schemas import (
     DocumentCreate,
@@ -19,15 +18,8 @@ from schemas import (
 from auth import verify_api_key, verify_admin_key
 
 app = FastAPI()
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-
-def get_embedding(text: str) -> list[float]:
-    response = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text,
-    )
-    return response.data[0].embedding
+DEFAULT_MAX_DISTANCE = 0.7
 
 
 @app.get("/health")
@@ -37,7 +29,7 @@ def health():
 
 @app.post("/documents", response_model=DocumentOut, dependencies=[Depends(verify_api_key)])
 def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
-    embedding = get_embedding(doc.content)
+    embedding = get_embedding(embedding_text(doc.title, doc.content))
     db_doc = Document(
         content=doc.content,
         embedding=embedding,
@@ -59,18 +51,21 @@ def search_documents(
     limit: int = 5,
     country: str | None = None,
     category: str | None = None,
+    max_distance: float = DEFAULT_MAX_DISTANCE,
     db: Session = Depends(get_db),
 ):
     query_embedding = get_embedding(query)
+    distance = Document.embedding.cosine_distance(query_embedding)
     q = db.query(
         Document.id,
         Document.content,
-        Document.embedding.cosine_distance(query_embedding).label("distance"),
+        distance.label("distance"),
     ).filter(Document.verified == True)
     if country is not None:
         q = q.filter(Document.country == country)
     if category is not None:
         q = q.filter(Document.category == category)
+    q = q.filter(distance <= max_distance)
     results = q.order_by("distance").limit(limit).all()
     return [
         SearchResult(id=r.id, content=r.content, distance=r.distance)
@@ -112,11 +107,12 @@ async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depe
         if not content:
             skipped.append({"row": i, "reason": "missing content"})
             continue
-        embedding = get_embedding(content)
+        title = row.get("title") or None
+        embedding = get_embedding(embedding_text(title, content))
         db_doc = Document(
             content=content,
             embedding=embedding,
-            title=row.get("title") or None,
+            title=title,
             country=row.get("country") or None,
             category=row.get("category") or None,
             source_url=row.get("source_url") or None,
@@ -136,14 +132,16 @@ def admin_search_documents(
     country: str | None = None,
     category: str | None = None,
     verified: bool | None = None,
+    max_distance: float | None = None,
     db: Session = Depends(get_db),
 ):
     query_embedding = get_embedding(query)
+    distance = Document.embedding.cosine_distance(query_embedding)
     q = db.query(
         Document.id,
         Document.content,
         Document.verified,
-        Document.embedding.cosine_distance(query_embedding).label("distance"),
+        distance.label("distance"),
     )
     if country is not None:
         q = q.filter(Document.country == country)
@@ -151,6 +149,9 @@ def admin_search_documents(
         q = q.filter(Document.category == category)
     if verified is not None:
         q = q.filter(Document.verified == verified)
+    # No cutoff by default, so the admin view can still see distant rows.
+    if max_distance is not None:
+        q = q.filter(distance <= max_distance)
     results = q.order_by("distance").limit(limit).all()
     return [
         AdminSearchResult(id=r.id, content=r.content, distance=r.distance, verified=r.verified)

@@ -1,121 +1,33 @@
 import json
-import os
 from datetime import datetime, timezone
-from types import SimpleNamespace
-from unittest.mock import patch
-
-# Dependencies (auth.py, database.py, main.py) read these from the environment
-# at import time, so they must be set before `main` is imported.
-os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
-os.environ.setdefault("API_KEY", "test-api-key")
-os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
-os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy.sql.elements import True_, False_
 
-from database import get_db
-from main import app
+from conftest import ADMIN_API_KEY, API_KEY, DEFAULT_EMBEDDING
+from embeddings import embedding_text
 from models import Document
 
-API_KEY = os.environ["API_KEY"]
-ADMIN_API_KEY = os.environ["ADMIN_API_KEY"]
+# Unit vectors chosen so cosine distance from DEFAULT_EMBEDDING (the query
+# vector the mocked embedder returns) is easy to reason about.
+NEAR_EMBEDDING = list(DEFAULT_EMBEDDING)                 # distance 0.0
+FAR_EMBEDDING = [0.0, 1.0] + [0.0] * 1534                # orthogonal: distance 1.0
 
 
-def _criterion_value(criterion):
-    """Pull the literal value out of a `Column == value` BinaryExpression.
-    Boolean literals compile to True_()/False_() singletons rather than a
-    regular BindParameter, so they need special-casing."""
-    right = criterion.right
-    if isinstance(right, True_):
-        return True
-    if isinstance(right, False_):
-        return False
-    return right.value
-
-
-class FakeQuery:
-    """Stand-in for a SQLAlchemy Query that supports the subset of the API
-    main.py actually uses (filter/order_by/offset/limit/first/all), evaluated
-    in-memory against whatever has been added to the FakeSession so far."""
-
-    def __init__(self, rows, entities):
-        self._rows = list(rows)
-        self._entities = entities
-
-    def filter(self, *criteria):
-        rows = self._rows
-        for criterion in criteria:
-            key = criterion.left.key
-            value = _criterion_value(criterion)
-            rows = [r for r in rows if getattr(r, key) == value]
-        return FakeQuery(rows, self._entities)
-
-    def order_by(self, *args):
-        return self  # ordering doesn't matter for these tests
-
-    def offset(self, n):
-        return FakeQuery(self._rows[n:], self._entities)
-
-    def limit(self, n):
-        return FakeQuery(self._rows[:n], self._entities)
-
-    def first(self):
-        return self._rows[0] if self._rows else None
-
-    def all(self):
-        return [self._project(r) for r in self._rows]
-
-    def _project(self, row):
-        if len(self._entities) == 1 and self._entities[0] is Document:
-            return row
-        values = {}
-        for ent in self._entities:
-            key = getattr(ent, "key", None) or getattr(ent, "name", None)
-            values[key] = 0.0 if key == "distance" else getattr(row, key)
-        return SimpleNamespace(**values)
-
-
-class FakeSession:
-    """Stand-in for a SQLAlchemy Session that only needs to support
-    add/commit/refresh/query, so tests don't require a real database
-    connection."""
-
-    def __init__(self):
-        self.added = []
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    def commit(self):
-        pass
-
-    def refresh(self, obj):
-        if getattr(obj, "id", None) is None:
-            obj.id = len(self.added)
-
-    def query(self, *entities):
-        return FakeQuery(self.added, entities)
-
-
-@pytest.fixture
-def fake_db():
-    session = FakeSession()
-    app.dependency_overrides[get_db] = lambda: session
-    yield session
-    app.dependency_overrides.pop(get_db, None)
-
-
-@pytest.fixture
-def mock_embeddings():
-    with patch("main.get_embedding", return_value=[0.0] * 1536) as mocked:
-        yield mocked
-
-
-@pytest.fixture
-def client():
-    return TestClient(app)
+def _seed_document(fake_db, **kwargs):
+    defaults = dict(
+        content="Some content",
+        embedding=list(DEFAULT_EMBEDDING),
+        title=None,
+        country=None,
+        category=None,
+        source_url=None,
+        verified=False,
+        created_at=datetime.now(timezone.utc),
+    )
+    defaults.update(kwargs)
+    doc = Document(**defaults)
+    fake_db.add(doc)
+    return doc
 
 
 def test_health(client):
@@ -270,23 +182,6 @@ def test_bulk_upload_skips_row_missing_content(client, fake_db, mock_embeddings)
     assert fake_db.added[0].content == "Real content"
 
 
-def _seed_document(fake_db, **kwargs):
-    defaults = dict(
-        content="Some content",
-        embedding=[0.0] * 1536,
-        title=None,
-        country=None,
-        category=None,
-        source_url=None,
-        verified=False,
-        created_at=datetime.now(timezone.utc),
-    )
-    defaults.update(kwargs)
-    doc = Document(**defaults)
-    fake_db.add(doc)
-    return doc
-
-
 def test_public_search_hides_unverified_shows_verified(client, fake_db, mock_embeddings):
     verified_doc = _seed_document(fake_db, id=1, content="Verified content", verified=True)
     _seed_document(fake_db, id=2, content="Unverified content", verified=False)
@@ -393,3 +288,105 @@ def test_bulk_upload_ignores_verified_in_file(client, fake_db, mock_embeddings):
     assert resp.json() == {"inserted": 1, "skipped": []}
     assert len(fake_db.added) == 1
     assert fake_db.added[0].verified is False
+
+
+# --- Relevance cutoff ---
+
+
+def test_public_search_applies_default_max_distance(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, embedding=NEAR_EMBEDDING, verified=True)
+    _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=True)
+
+    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+
+    assert resp.status_code == 200
+    # The orthogonal row sits at distance 1.0, past the 0.7 default.
+    assert [r["id"] for r in resp.json()] == [1]
+
+
+def test_public_search_respects_explicit_max_distance(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, embedding=NEAR_EMBEDDING, verified=True)
+    _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=True)
+
+    resp = client.get(
+        "/documents/search?query=test&max_distance=1.5",
+        headers={"x-api-key": API_KEY},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [r["id"] for r in body] == [1, 2]
+    assert body[0]["distance"] == pytest.approx(0.0)
+    assert body[1]["distance"] == pytest.approx(1.0)
+
+    resp = client.get(
+        "/documents/search?query=test&max_distance=0.0",
+        headers={"x-api-key": API_KEY},
+    )
+    assert resp.status_code == 200
+    assert [r["id"] for r in resp.json()] == [1]
+
+
+def test_admin_search_has_no_cutoff_by_default(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, embedding=NEAR_EMBEDDING, verified=True)
+    _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=False)
+
+    resp = client.get(
+        "/admin/documents/search?query=test",
+        headers={"x-api-key": ADMIN_API_KEY},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Both rows come back even though id=2 is past the public 0.7 cutoff.
+    assert [r["id"] for r in body] == [1, 2]
+    assert body[1]["distance"] == pytest.approx(1.0)
+
+
+def test_admin_search_respects_max_distance(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, embedding=NEAR_EMBEDDING, verified=True)
+    _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=True)
+
+    resp = client.get(
+        "/admin/documents/search?query=test&max_distance=0.5",
+        headers={"x-api-key": ADMIN_API_KEY},
+    )
+
+    assert resp.status_code == 200
+    assert [r["id"] for r in resp.json()] == [1]
+
+
+# --- Embedding text ---
+
+
+def test_embedding_text_prepends_title():
+    assert embedding_text("A Title", "Body text") == "A Title\nBody text"
+
+
+def test_embedding_text_without_title_is_content_only():
+    assert embedding_text(None, "Body text") == "Body text"
+    assert embedding_text("", "Body text") == "Body text"
+
+
+def test_create_document_embeds_title_and_content(client, fake_db, mock_embeddings):
+    resp = client.post(
+        "/documents",
+        headers={"x-api-key": API_KEY},
+        json={"title": "My Title", "content": "My content"},
+    )
+
+    assert resp.status_code == 200
+    assert mock_embeddings.call_args.args[0] == "My Title\nMy content"
+
+
+def test_bulk_upload_embeds_title_and_content(client, fake_db, mock_embeddings):
+    csv_bytes = b"title,content\nRow Title,Row content\n"
+    files = {"file": ("docs.csv", csv_bytes, "text/csv")}
+
+    resp = client.post(
+        "/admin/documents/bulk",
+        headers={"x-api-key": ADMIN_API_KEY},
+        files=files,
+    )
+
+    assert resp.status_code == 200
+    assert mock_embeddings.call_args.args[0] == "Row Title\nRow content"
