@@ -3,7 +3,7 @@ import io
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, File, HTTPException, UploadFile
+from fastapi import FastAPI, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.orm import Session
 
 import checklist
@@ -16,6 +16,8 @@ from schemas import (
     SearchResult,
     AdminSearchResult,
     AdminDocumentOut,
+    AdminDocumentDetail,
+    DocumentUpdate,
     VerifiedUpdate,
     ChecklistProfile,
     ChecklistResponse,
@@ -204,6 +206,57 @@ def update_document_verified(document_id: int, payload: VerifiedUpdate, db: Sess
     db.commit()
     db.refresh(doc)
     return doc
+
+
+def _get_document_or_404(db: Session, document_id: int) -> Document:
+    doc = db.query(Document).filter(Document.id == document_id).first()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@app.get("/admin/documents/{document_id}", response_model=AdminDocumentDetail, dependencies=[Depends(verify_admin_key)])
+def get_admin_document(document_id: int, db: Session = Depends(get_db)):
+    return _get_document_or_404(db, document_id)
+
+
+# Changing any of these means the document says something its reviewer never
+# saw, so the update drops it back to unverified (and out of public search and
+# the public checklist) until someone reviews it again.
+_REVIEWED_FIELDS = {"title", "content", "source_url"}
+
+
+@app.patch("/admin/documents/{document_id}", response_model=AdminDocumentDetail, dependencies=[Depends(verify_admin_key)])
+def update_document(document_id: int, payload: DocumentUpdate, db: Session = Depends(get_db)):
+    doc = _get_document_or_404(db, document_id)
+
+    changes = {}
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        if isinstance(value, str):
+            value = value.strip() or None
+        if field == "content" and value is None:
+            raise HTTPException(status_code=422, detail="Content can't be empty")
+        if getattr(doc, field) != value:
+            changes[field] = value
+
+    for field, value in changes.items():
+        setattr(doc, field, value)
+    if changes.keys() & {"title", "content"}:
+        doc.embedding = get_embedding(embedding_text(doc.title, doc.content))
+    if changes.keys() & _REVIEWED_FIELDS:
+        doc.verified = False
+
+    db.commit()
+    db.refresh(doc)
+    return doc
+
+
+@app.delete("/admin/documents/{document_id}", status_code=204, dependencies=[Depends(verify_admin_key)])
+def delete_document(document_id: int, db: Session = Depends(get_db)):
+    doc = _get_document_or_404(db, document_id)
+    db.delete(doc)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.post("/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_api_key)])

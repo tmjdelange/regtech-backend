@@ -166,13 +166,16 @@ class FakeQuery:
 
 class FakeSession:
     """Stand-in for a SQLAlchemy Session that only supports
-    add/commit/refresh/query, so tests never need a database connection."""
+    add/delete/commit/refresh/query, so tests never need a database connection."""
 
     def __init__(self):
         self.added = []
 
     def add(self, obj):
         self.added.append(obj)
+
+    def delete(self, obj):
+        self.added.remove(obj)
 
     def commit(self):
         pass

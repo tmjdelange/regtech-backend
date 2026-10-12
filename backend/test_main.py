@@ -271,6 +271,136 @@ def test_admin_endpoints_reject_regular_api_key(client, fake_db, mock_embeddings
     assert resp.status_code == 401
 
 
+def test_admin_get_document_returns_content(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, title="T", content="Full content", verified=True)
+
+    resp = client.get("/admin/documents/1", headers={"x-api-key": ADMIN_API_KEY})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["content"] == "Full content"
+    assert body["title"] == "T"
+    assert body["verified"] is True
+
+    resp = client.get("/admin/documents/999", headers={"x-api-key": ADMIN_API_KEY})
+    assert resp.status_code == 404
+
+
+def test_update_metadata_only_keeps_verified_and_embedding(client, fake_db, mock_embeddings):
+    doc = _seed_document(fake_db, id=1, country="UK", verified=True, embedding=list(FAR_EMBEDDING))
+
+    resp = client.patch(
+        "/admin/documents/1",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"country": "IE", "category": "labelling"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["country"] == "IE"
+    assert resp.json()["category"] == "labelling"
+    assert resp.json()["verified"] is True
+    assert doc.embedding == FAR_EMBEDDING
+    mock_embeddings.assert_not_called()
+
+
+def test_update_content_reembeds_and_resets_verified(client, fake_db, mock_embeddings):
+    doc = _seed_document(fake_db, id=1, title="Title", content="Old", verified=True)
+
+    resp = client.patch(
+        "/admin/documents/1",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"content": "New content"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["content"] == "New content"
+    assert resp.json()["verified"] is False
+    assert mock_embeddings.call_args.args[0] == "Title\nNew content"
+    assert doc.verified is False
+
+
+def test_update_source_url_resets_verified_without_reembedding(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, source_url="https://old.example", verified=True)
+
+    resp = client.patch(
+        "/admin/documents/1",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"source_url": "https://new.example"},
+    )
+    assert resp.json()["verified"] is False
+    mock_embeddings.assert_not_called()
+
+
+def test_update_with_unchanged_values_keeps_verified(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, title="Title", content="Same", verified=True)
+
+    resp = client.patch(
+        "/admin/documents/1",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"title": "Title", "content": "Same"},
+    )
+    assert resp.json()["verified"] is True
+    mock_embeddings.assert_not_called()
+
+
+def test_update_empty_string_clears_optional_field(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, category="labelling")
+
+    resp = client.patch(
+        "/admin/documents/1",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"category": "  "},
+    )
+    assert resp.json()["category"] is None
+
+
+def test_update_rejects_empty_content(client, fake_db, mock_embeddings):
+    doc = _seed_document(fake_db, id=1, content="Keep me")
+
+    for content in ("", "   ", None):
+        resp = client.patch(
+            "/admin/documents/1",
+            headers={"x-api-key": ADMIN_API_KEY},
+            json={"content": content},
+        )
+        assert resp.status_code == 422
+    assert doc.content == "Keep me"
+
+
+def test_update_missing_id_returns_404(client, fake_db, mock_embeddings):
+    resp = client.patch(
+        "/admin/documents/999",
+        headers={"x-api-key": ADMIN_API_KEY},
+        json={"country": "UK"},
+    )
+    assert resp.status_code == 404
+
+
+def test_delete_removes_document_from_listing_and_search(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, verified=True)
+    _seed_document(fake_db, id=2, verified=True)
+
+    resp = client.delete("/admin/documents/1", headers={"x-api-key": ADMIN_API_KEY})
+    assert resp.status_code == 204
+
+    resp = client.get("/admin/documents", headers={"x-api-key": ADMIN_API_KEY})
+    assert [d["id"] for d in resp.json()] == [2]
+    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+    assert [r["id"] for r in resp.json()] == [2]
+
+    resp = client.delete("/admin/documents/1", headers={"x-api-key": ADMIN_API_KEY})
+    assert resp.status_code == 404
+
+
+def test_document_edit_endpoints_reject_regular_api_key(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1)
+
+    assert client.get("/admin/documents/1", headers={"x-api-key": API_KEY}).status_code == 401
+    resp = client.patch(
+        "/admin/documents/1", headers={"x-api-key": API_KEY}, json={"country": "UK"}
+    )
+    assert resp.status_code == 401
+    assert client.delete("/admin/documents/1", headers={"x-api-key": API_KEY}).status_code == 401
+    assert len(fake_db.added) == 1
+
+
 def test_bulk_upload_ignores_verified_in_file(client, fake_db, mock_embeddings):
     csv_bytes = (
         b"country,category,title,content,source_url,verified\n"

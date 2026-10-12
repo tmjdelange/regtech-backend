@@ -43,6 +43,18 @@ class AdminDocumentOut(BaseModel):
     class Config:
         from_attributes = True
 
+class AdminDocumentDetail(AdminDocumentOut):
+    content: str
+
+class DocumentUpdate(BaseModel):
+    """Partial update: only the fields present in the request are changed.
+    Sending null (or an empty string) clears an optional field."""
+    title: Optional[str] = None
+    content: Optional[str] = None
+    country: Optional[str] = None
+    category: Optional[str] = None
+    source_url: Optional[str] = None
+
 class VerifiedUpdate(BaseModel):
     verified: bool
 
