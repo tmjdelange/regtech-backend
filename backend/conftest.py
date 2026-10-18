@@ -25,7 +25,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.sql.elements import BinaryExpression, False_, Grouping, True_
+from sqlalchemy.sql.elements import BinaryExpression, False_, Grouping, Null, True_
 from types import SimpleNamespace
 
 from database import get_db
@@ -72,9 +72,11 @@ def _query_embedding_from(entities):
 
 def _criterion_value(criterion):
     """Pull the literal value out of a `Column == value` BinaryExpression.
-    Boolean literals compile to True_()/False_() singletons rather than a
-    regular BindParameter, so they need special-casing."""
+    Boolean and NULL literals compile to True_()/False_()/Null() singletons
+    rather than a regular BindParameter, so they need special-casing."""
     right = criterion.right
+    if isinstance(right, Null):  # `column.is_(None)`
+        return None
     if isinstance(right, True_):
         return True
     if isinstance(right, False_):

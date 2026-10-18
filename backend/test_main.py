@@ -99,7 +99,7 @@ def test_bulk_upload_csv_success(client, fake_db, mock_embeddings):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body == {"inserted": 2, "skipped": []}
+    assert (body["inserted"], body["updated"], body["skipped"], body["failed"]) == (2, 0, 0, 0)
     assert len(fake_db.added) == 2
     assert fake_db.added[0].content == "Some regulatory content A"
     assert fake_db.added[0].country == "US"
@@ -122,7 +122,7 @@ def test_bulk_upload_saves_title(client, fake_db, mock_embeddings):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"inserted": 1, "skipped": []}
+    assert resp.json()["inserted"] == 1
     assert len(fake_db.added) == 1
     assert fake_db.added[0].title == "Title A"
 
@@ -154,11 +154,158 @@ def test_bulk_upload_json_success(client, fake_db, mock_embeddings):
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body == {"inserted": 2, "skipped": []}
+    assert (body["inserted"], body["updated"], body["skipped"], body["failed"]) == (2, 0, 0, 0)
     assert len(fake_db.added) == 2
     assert fake_db.added[1].content == "Some regulatory content B"
     assert fake_db.added[1].country == "UK"
     assert mock_embeddings.call_count == 2
+
+
+def _bulk_rows():
+    rows = [
+        {"title": "DE rule", "country": "DE", "category": "beverages_non_alcoholic",
+         "content": "German content", "source_url": "https://example.com/de"},
+        {"title": "FR rule", "country": "FR", "category": "beverages_non_alcoholic",
+         "content": "French content", "source_url": "https://example.com/fr"},
+        {"title": "US rule", "country": "US", "category": "beverages_non_alcoholic",
+         "content": "US content", "source_url": "https://example.com/us"},
+    ]
+    return rows
+
+
+def _post_bulk(client, rows, *, dry_run=False):
+    path = "/admin/documents/bulk/dry-run" if dry_run else "/admin/documents/bulk"
+    files = {"file": ("docs.json", json.dumps(rows).encode("utf-8"), "application/json")}
+    resp = client.post(path, headers={"x-api-key": ADMIN_API_KEY}, files=files)
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def _counts(body):
+    return body["inserted"], body["updated"], body["skipped"], body["failed"]
+
+
+def test_bulk_import_valid_file_reports_counts_per_country(client, fake_db, mock_embeddings):
+    body = _post_bulk(client, _bulk_rows())
+
+    assert body["dry_run"] is False
+    assert _counts(body) == (3, 0, 0, 0)
+    assert body["by_country"]["DE"] == {"inserted": 1, "updated": 0, "skipped": 0, "failed": 0}
+    assert {doc.country for doc in fake_db.added} == {"DE", "FR", "US"}
+    assert mock_embeddings.call_args_list[0].args[0] == "DE rule\nGerman content"
+
+
+def test_bulk_import_row_missing_required_field_fails(client, fake_db, mock_embeddings):
+    rows = _bulk_rows()
+    del rows[0]["title"]
+    rows[1]["content"] = "   "
+
+    body = _post_bulk(client, rows)
+
+    assert _counts(body) == (1, 0, 0, 2)
+    assert body["rows"][0]["reason"] == "missing title"
+    assert body["rows"][1]["reason"] == "missing content"
+    assert [doc.title for doc in fake_db.added] == ["US rule"]
+
+
+def test_bulk_import_is_idempotent(client, fake_db, mock_embeddings):
+    _post_bulk(client, _bulk_rows())
+    embed_calls = mock_embeddings.call_count
+
+    body = _post_bulk(client, _bulk_rows())
+
+    assert _counts(body) == (0, 0, 3, 0)
+    assert len(fake_db.added) == 3
+    assert mock_embeddings.call_count == embed_calls
+
+
+def test_bulk_import_same_title_other_country_is_a_new_row(client, fake_db, mock_embeddings):
+    _post_bulk(client, _bulk_rows())
+    rows = _bulk_rows()
+    rows[0]["country"] = "AT"
+
+    body = _post_bulk(client, rows)
+
+    assert _counts(body) == (1, 0, 2, 0)
+    assert len(fake_db.added) == 4
+
+
+def test_bulk_import_duplicate_in_file_fails(client, fake_db, mock_embeddings):
+    rows = _bulk_rows()
+    rows.append(dict(rows[0]))
+
+    body = _post_bulk(client, rows)
+
+    assert _counts(body) == (3, 0, 0, 1)
+    assert body["rows"][3]["reason"] == "duplicate title and country in file"
+
+
+def test_bulk_import_changed_content_updates_reembeds_and_unverifies(client, fake_db, mock_embeddings):
+    _post_bulk(client, _bulk_rows())
+    for doc in fake_db.added:
+        doc.verified = True
+    rows = _bulk_rows()
+    rows[0]["content"] = "Revised German content"
+    rows[1]["source_url"] = "https://example.com/fr-new"
+    mock_embeddings.reset_mock()
+
+    body = _post_bulk(client, rows)
+
+    assert _counts(body) == (0, 2, 1, 0)
+    de, fr, us = fake_db.added
+    assert de.content == "Revised German content"
+    assert de.verified is False
+    assert fr.source_url == "https://example.com/fr-new"
+    assert fr.verified is False
+    assert us.verified is True  # unchanged, so its review stands
+    # only the content change needs a new embedding
+    assert [c.args[0] for c in mock_embeddings.call_args_list] == ["DE rule\nRevised German content"]
+    assert body["rows"][0]["changed"] == ["content"]
+    assert body["rows"][1]["changed"] == ["source_url"]
+
+
+def test_bulk_import_never_sets_verified(client, fake_db, mock_embeddings):
+    rows = _bulk_rows()
+    for row in rows:
+        row["verified"] = True
+
+    _post_bulk(client, rows)
+
+    assert len(fake_db.added) == 3
+    assert all(doc.verified is False for doc in fake_db.added)
+
+
+def test_bulk_import_dry_run_writes_nothing(client, fake_db, mock_embeddings):
+    _post_bulk(client, _bulk_rows()[:1])
+    fake_db.added[0].verified = True
+    rows = _bulk_rows()
+    rows[0]["content"] = "Revised German content"
+    mock_embeddings.reset_mock()
+
+    body = _post_bulk(client, rows, dry_run=True)
+
+    assert body["dry_run"] is True
+    assert _counts(body) == (2, 1, 0, 0)
+    assert len(fake_db.added) == 1
+    assert fake_db.added[0].content == "German content"
+    assert fake_db.added[0].verified is True
+    mock_embeddings.assert_not_called()
+
+
+def test_bulk_import_embedding_failure_counts_as_failed(client, fake_db, mock_embeddings):
+    mock_embeddings.side_effect = [list(DEFAULT_EMBEDDING), RuntimeError("boom"), list(DEFAULT_EMBEDDING)]
+
+    body = _post_bulk(client, _bulk_rows())
+
+    assert _counts(body) == (2, 0, 0, 1)
+    assert body["rows"][1]["reason"] == "embedding failed (RuntimeError)"
+    assert [doc.title for doc in fake_db.added] == ["DE rule", "US rule"]
+
+
+def test_bulk_import_dry_run_requires_admin_key(client, fake_db):
+    files = {"file": ("docs.json", json.dumps(_bulk_rows()).encode("utf-8"), "application/json")}
+    resp = client.post("/admin/documents/bulk/dry-run", headers={"x-api-key": API_KEY}, files=files)
+    assert resp.status_code == 401
 
 
 def test_bulk_upload_skips_row_missing_content(client, fake_db, mock_embeddings):
@@ -178,7 +325,9 @@ def test_bulk_upload_skips_row_missing_content(client, fake_db, mock_embeddings)
     assert resp.status_code == 200
     body = resp.json()
     assert body["inserted"] == 1
-    assert body["skipped"] == [{"row": 0, "reason": "missing content"}]
+    assert body["failed"] == 1
+    assert body["rows"][0]["result"] == "failed"
+    assert body["rows"][0]["reason"] == "missing content"
     assert len(fake_db.added) == 1
     assert fake_db.added[0].content == "Real content"
 
@@ -416,7 +565,7 @@ def test_bulk_upload_ignores_verified_in_file(client, fake_db, mock_embeddings):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"inserted": 1, "skipped": []}
+    assert resp.json()["inserted"] == 1
     assert len(fake_db.added) == 1
     assert fake_db.added[0].verified is False
 

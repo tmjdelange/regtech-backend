@@ -110,8 +110,7 @@ def _is_json_upload(file: UploadFile) -> bool:
     return "json" in content_type
 
 
-@app.post("/admin/documents/bulk", dependencies=[Depends(verify_admin_key)])
-async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def _read_upload_rows(file: UploadFile) -> list:
     raw = await file.read()
     try:
         text = raw.decode("utf-8")
@@ -123,33 +122,119 @@ async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depe
             parsed = json.loads(text)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON file")
-        rows = parsed if isinstance(parsed, list) else [parsed]
-    else:
-        rows = list(csv.DictReader(io.StringIO(text)))
+        return parsed if isinstance(parsed, list) else [parsed]
+    return list(csv.DictReader(io.StringIO(text)))
 
-    inserted = 0
-    skipped = []
+
+def _clean(value):
+    """Strip a string field; blank or missing becomes None."""
+    if value is None:
+        return None
+    return str(value).strip() or None
+
+
+# Fields an existing row is compared on. Title and country are the row's
+# identity, so a re-upload of the same file finds the rows it created.
+_BULK_COMPARED_FIELDS = ("content", "category", "source_url")
+_BULK_RESULTS = ("inserted", "updated", "skipped", "failed")
+
+
+def _import_rows(db: Session, rows: list, *, dry_run: bool) -> dict:
+    """Insert new rows, update rows whose content, category or source_url
+    changed, and skip unchanged ones. Every inserted or updated row ends up
+    unverified. With dry_run, report what would happen without writing or
+    calling the embedding API."""
+    report_rows = []
+    seen = set()
+
     for i, row in enumerate(rows):
-        content = (row.get("content") or "").strip() if isinstance(row, dict) else ""
-        if not content:
-            skipped.append({"row": i, "reason": "missing content"})
+        if not isinstance(row, dict):
+            report_rows.append({"row": i, "title": None, "country": None,
+                                "result": "failed", "reason": "not an object", "changed": []})
             continue
-        title = row.get("title") or None
-        embedding = get_embedding(embedding_text(title, content))
-        db_doc = Document(
-            content=content,
-            embedding=embedding,
-            title=title,
-            country=row.get("country") or None,
-            category=row.get("category") or None,
-            source_url=row.get("source_url") or None,
-            verified=False,  # always unverified on bulk import, regardless of any "verified" value in the file
-        )
-        db.add(db_doc)
-        inserted += 1
 
-    db.commit()
-    return {"inserted": inserted, "skipped": skipped}
+        fields = {key: _clean(row.get(key))
+                  for key in ("title", "country", "category", "content", "source_url")}
+        entry = {"row": i, "title": fields["title"], "country": fields["country"],
+                 "result": None, "reason": None, "changed": []}
+        report_rows.append(entry)
+
+        missing = [key for key in ("title", "content") if fields[key] is None]
+        if missing:
+            entry["result"], entry["reason"] = "failed", "missing " + ", ".join(missing)
+            continue
+
+        identity = (fields["title"], fields["country"])
+        if identity in seen:
+            entry["result"], entry["reason"] = "failed", "duplicate title and country in file"
+            continue
+        seen.add(identity)
+
+        country_filter = (
+            Document.country.is_(None) if fields["country"] is None
+            else Document.country == fields["country"]
+        )
+        existing = db.query(Document).filter(Document.title == fields["title"], country_filter).all()
+        if len(existing) > 1:
+            entry["result"] = "failed"
+            entry["reason"] = f"{len(existing)} existing rows have this title and country"
+            continue
+
+        if existing:
+            doc = existing[0]
+            changed = [key for key in _BULK_COMPARED_FIELDS if getattr(doc, key) != fields[key]]
+            if not changed:
+                entry["result"], entry["reason"] = "skipped", "unchanged"
+                continue
+            entry["changed"] = changed
+            if not dry_run:
+                try:
+                    if "content" in changed:
+                        doc.embedding = get_embedding(embedding_text(fields["title"], fields["content"]))
+                except Exception as exc:
+                    entry["result"], entry["reason"] = "failed", f"embedding failed ({type(exc).__name__})"
+                    continue
+                for key in changed:
+                    setattr(doc, key, fields[key])
+                doc.verified = False
+            entry["result"] = "updated"
+            continue
+
+        if not dry_run:
+            try:
+                embedding = get_embedding(embedding_text(fields["title"], fields["content"]))
+            except Exception as exc:
+                entry["result"], entry["reason"] = "failed", f"embedding failed ({type(exc).__name__})"
+                continue
+            # always unverified on bulk import, regardless of any "verified" value in the file
+            db.add(Document(embedding=embedding, verified=False, **fields))
+        entry["result"] = "inserted"
+
+    if not dry_run:
+        db.commit()
+
+    by_country = {}
+    for entry in report_rows:
+        counts = by_country.setdefault(entry["country"] or "(none)",
+                                       {result: 0 for result in _BULK_RESULTS})
+        counts[entry["result"]] += 1
+
+    totals = {result: sum(1 for e in report_rows if e["result"] == result) for result in _BULK_RESULTS}
+    return {"dry_run": dry_run, **totals, "by_country": by_country, "rows": report_rows}
+
+
+@app.post("/admin/documents/bulk", dependencies=[Depends(verify_admin_key)])
+async def bulk_upload_documents(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    rows = await _read_upload_rows(file)
+    return _import_rows(db, rows, dry_run=False)
+
+
+# A separate route rather than a ?dry_run flag: a backend that predates it
+# answers 404 instead of silently ignoring the flag and importing for real.
+@app.post("/admin/documents/bulk/dry-run", dependencies=[Depends(verify_admin_key)])
+async def bulk_upload_documents_dry_run(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    rows = await _read_upload_rows(file)
+    return _import_rows(db, rows, dry_run=True)
 
 
 @app.get("/admin/documents/search", response_model=list[AdminSearchResult], dependencies=[Depends(verify_admin_key)])
