@@ -2,6 +2,13 @@ from pydantic import BaseModel
 from datetime import datetime
 from typing import List, Literal, Optional, Union
 
+import countries
+
+# Literal over the allowlists, so an unknown code is a 422 with the allowed
+# values listed, and the OpenAPI schema shows them as an enum.
+DestinationCode = Literal[tuple(countries.DESTINATIONS)]
+OriginCode = Literal[tuple(countries.ORIGINS)]
+
 class DocumentCreate(BaseModel):
     content: str
     title: Optional[str] = None
@@ -22,14 +29,29 @@ class DocumentOut(BaseModel):
 
 class SearchResult(BaseModel):
     id: int
+    title: Optional[str] = None
+    country: Optional[str] = None
     content: str
     distance: float
 
-class AdminSearchResult(BaseModel):
-    id: int
-    content: str
-    distance: float
+class AdminSearchResult(SearchResult):
     verified: bool
+
+class CountryOrigin(BaseModel):
+    code: str
+    name: str
+    default: bool
+
+class CountryDestination(BaseModel):
+    code: str
+    name: str
+    document_count: int
+    checklist_available: bool
+    eu_member: bool
+
+class CountriesResponse(BaseModel):
+    origins: List[CountryOrigin]
+    destinations: List[CountryDestination]
 
 class AdminDocumentOut(BaseModel):
     id: int
@@ -90,7 +112,12 @@ class ChecklistCounts(BaseModel):
     not_applicable: int
     not_assessed: int
 
-class ChecklistResult(BaseModel):
+class ChecklistRoute(BaseModel):
+    origin: str
+    destination: str
+
+class ChecklistResult(ChecklistRoute):
+    checklist_available: Literal[True] = True
     headline: str
     counts: ChecklistCounts
     items: List[ChecklistItem]
@@ -99,7 +126,12 @@ class ChecklistResult(BaseModel):
     scope: str
     disclaimer: str
 
-class ChecklistOutOfScope(BaseModel):
+class ChecklistOutOfScope(ChecklistRoute):
+    checklist_available: Literal[True] = True
     message: str
 
-ChecklistResponse = Union[ChecklistResult, ChecklistOutOfScope]
+class ChecklistUnavailable(ChecklistRoute):
+    checklist_available: Literal[False] = False
+    message: str
+
+ChecklistResponse = Union[ChecklistResult, ChecklistOutOfScope, ChecklistUnavailable]

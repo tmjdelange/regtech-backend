@@ -26,6 +26,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.sql.elements import BinaryExpression, False_, Grouping, Null, True_
+from sqlalchemy.sql.operators import in_op
 from types import SimpleNamespace
 
 from database import get_db
@@ -120,6 +121,11 @@ class FakeQuery:
                     for r in rows
                     if compare(cosine_distance(r.embedding, vector), cutoff)
                 ]
+            elif criterion.operator is in_op:
+                # `column.in_([...])`: like SQL, a NULL column matches nothing.
+                key = left.key
+                values = criterion.right.value
+                rows = [r for r in rows if getattr(r, key) is not None and getattr(r, key) in values]
             else:
                 key = left.key
                 value = _criterion_value(criterion)

@@ -19,7 +19,7 @@ def _seed_document(fake_db, **kwargs):
         content="Some content",
         embedding=list(DEFAULT_EMBEDDING),
         title=None,
-        country=None,
+        country="UK",
         category=None,
         source_url=None,
         verified=False,
@@ -52,13 +52,13 @@ def test_create_document_rejects_wrong_key(client):
 
 
 def test_search_requires_auth(client):
-    resp = client.get("/documents/search?query=test")
+    resp = client.get("/documents/search?destination=UK&query=test")
     assert resp.status_code == 422  # missing header entirely
 
 
 def test_search_rejects_wrong_key(client):
     resp = client.get(
-        "/documents/search?query=test",
+        "/documents/search?destination=UK&query=test",
         headers={"x-api-key": "wrong-key"},
     )
     assert resp.status_code == 401  # header present, but invalid
@@ -337,7 +337,7 @@ def test_public_search_hides_unverified_shows_verified(client, fake_db, mock_emb
     _seed_document(fake_db, id=2, content="Unverified content", verified=False)
 
     resp = client.get(
-        "/documents/search?query=test",
+        "/documents/search?destination=UK&query=test",
         headers={"x-api-key": API_KEY},
     )
 
@@ -382,7 +382,7 @@ def test_admin_search_verified_filter(client, fake_db, mock_embeddings):
 def test_patch_verified_flips_flag_and_public_search_finds_it(client, fake_db, mock_embeddings):
     _seed_document(fake_db, id=1, content="Some content", verified=False)
 
-    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+    resp = client.get("/documents/search?destination=UK&query=test", headers={"x-api-key": API_KEY})
     assert resp.json() == []
 
     resp = client.patch(
@@ -393,7 +393,7 @@ def test_patch_verified_flips_flag_and_public_search_finds_it(client, fake_db, m
     assert resp.status_code == 200
     assert resp.json()["verified"] is True
 
-    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+    resp = client.get("/documents/search?destination=UK&query=test", headers={"x-api-key": API_KEY})
     assert [r["id"] for r in resp.json()] == [1]
 
 
@@ -532,7 +532,7 @@ def test_delete_removes_document_from_listing_and_search(client, fake_db, mock_e
 
     resp = client.get("/admin/documents", headers={"x-api-key": ADMIN_API_KEY})
     assert [d["id"] for d in resp.json()] == [2]
-    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+    resp = client.get("/documents/search?destination=UK&query=test", headers={"x-api-key": API_KEY})
     assert [r["id"] for r in resp.json()] == [2]
 
     resp = client.delete("/admin/documents/1", headers={"x-api-key": ADMIN_API_KEY})
@@ -577,7 +577,7 @@ def test_public_search_applies_default_max_distance(client, fake_db, mock_embedd
     _seed_document(fake_db, id=1, embedding=NEAR_EMBEDDING, verified=True)
     _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=True)
 
-    resp = client.get("/documents/search?query=test", headers={"x-api-key": API_KEY})
+    resp = client.get("/documents/search?destination=UK&query=test", headers={"x-api-key": API_KEY})
 
     assert resp.status_code == 200
     # The orthogonal row sits at distance 1.0, past the 0.7 default.
@@ -589,7 +589,7 @@ def test_public_search_respects_explicit_max_distance(client, fake_db, mock_embe
     _seed_document(fake_db, id=2, embedding=FAR_EMBEDDING, verified=True)
 
     resp = client.get(
-        "/documents/search?query=test&max_distance=1.5",
+        "/documents/search?destination=UK&query=test&max_distance=1.5",
         headers={"x-api-key": API_KEY},
     )
     assert resp.status_code == 200
@@ -599,7 +599,7 @@ def test_public_search_respects_explicit_max_distance(client, fake_db, mock_embe
     assert body[1]["distance"] == pytest.approx(1.0)
 
     resp = client.get(
-        "/documents/search?query=test&max_distance=0.0",
+        "/documents/search?destination=UK&query=test&max_distance=0.0",
         headers={"x-api-key": API_KEY},
     )
     assert resp.status_code == 200
@@ -729,10 +729,10 @@ def _checklist_profile(**overrides):
     return profile
 
 
-def _evaluate_checklist(client, profile, *, admin=False):
+def _evaluate_checklist(client, profile, *, admin=False, destination="UK"):
     path = "/admin/checklist/evaluate" if admin else "/checklist/evaluate"
     key = ADMIN_API_KEY if admin else API_KEY
-    return client.post(path, headers={"x-api-key": key}, json=profile)
+    return client.post(path, params={"destination": destination}, headers={"x-api-key": key}, json=profile)
 
 
 def _items_by_id(body):
@@ -770,10 +770,13 @@ def test_checklist_out_of_scope_above_1_2_abv(client, fake_db):
     resp = _evaluate_checklist(client, _checklist_profile(abv_percent=1.3))
     assert resp.status_code == 200
     assert resp.json() == {
+        "origin": "NL",
+        "destination": "UK",
+        "checklist_available": True,
         "message": (
             "This checker covers drinks up to 1.2% ABV. Higher-ABV drinks "
             "fall under different rules that aren't covered here."
-        )
+        ),
     }
 
 
@@ -1103,3 +1106,174 @@ def test_checklist_scenario_from_brief(client, fake_db):
         "label_elements",
     ]
     assert all(item["reviewed"] is True for item in body["items"])
+
+
+def test_checklist_report_includes_origin_and_destination(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    body = _evaluate_checklist(client, _checklist_profile()).json()
+    assert body["origin"] == "NL"
+    assert body["destination"] == "UK"
+    assert body["checklist_available"] is True
+
+
+def test_checklist_destination_without_rules_does_not_run_uk_rules(client, fake_db, monkeypatch):
+    _seed_checklist_documents(fake_db)
+    import checklist as checklist_module
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("UK rules must not run for another destination")
+
+    monkeypatch.setattr(checklist_module, "evaluate", must_not_run)
+    monkeypatch.setattr(checklist_module, "is_out_of_scope", must_not_run)
+
+    for admin in (False, True):
+        resp = _evaluate_checklist(client, _checklist_profile(), admin=admin, destination="DE")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "origin": "NL",
+            "destination": "DE",
+            "checklist_available": False,
+            "message": "Checklist not available for this destination yet. You can still search the requirements.",
+        }
+
+
+def test_checklist_requires_known_destination_and_origin(client, fake_db):
+    profile = _checklist_profile()
+    headers = {"x-api-key": API_KEY}
+    assert client.post("/checklist/evaluate", headers=headers, json=profile).status_code == 422
+    for params in ({"destination": "EU"}, {"destination": "XX"}, {"destination": "UK", "origin": "BE"}):
+        resp = client.post("/checklist/evaluate", params=params, headers=headers, json=profile)
+        assert resp.status_code == 422, params
+
+
+def test_checklist_wording_never_contains_forbidden_words_for_any_destination(client, fake_db):
+    _seed_checklist_documents(fake_db)
+    for destination in ("UK", "DE", "FR", "AE", "US", "CN"):
+        for abv in (0.5, 5.0):
+            text = json.dumps(
+                _evaluate_checklist(client, _checklist_profile(abv_percent=abv), destination=destination).json()
+            ).lower()
+            for forbidden in ("compliant", "certified", "ready"):
+                assert forbidden not in text, (destination, abv, forbidden)
+
+
+# --- Countries and destination-scoped search ---
+
+
+def _countries(client):
+    resp = client.get("/countries", headers={"x-api-key": API_KEY})
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_countries_requires_api_key(client):
+    assert client.get("/countries").status_code == 422
+    assert client.get("/countries", headers={"x-api-key": "wrong-key"}).status_code == 401
+
+
+def test_countries_lists_only_destinations_with_verified_rows(client, fake_db):
+    _seed_document(fake_db, id=1, country="UK", verified=True)
+    _seed_document(fake_db, id=2, country="UK", verified=True)
+    _seed_document(fake_db, id=3, country="DE", verified=True)
+    _seed_document(fake_db, id=4, country="FR", verified=False)
+    _seed_document(fake_db, id=5, country="EU", verified=True)
+    _seed_document(fake_db, id=6, country=None, verified=True)
+    _seed_document(fake_db, id=7, country="XX", verified=True)
+
+    body = _countries(client)
+
+    assert body["origins"] == [{"code": "NL", "name": "The Netherlands", "default": True}]
+    assert body["destinations"] == [
+        {"code": "DE", "name": "Germany", "document_count": 1, "checklist_available": False, "eu_member": True},
+        {"code": "UK", "name": "United Kingdom", "document_count": 2, "checklist_available": True, "eu_member": False},
+    ]
+
+
+def test_countries_reflects_verification_without_restart(client, fake_db):
+    _seed_document(fake_db, id=1, country="UK", verified=True)
+    _seed_document(fake_db, id=2, country="DE", verified=False)
+    assert [d["code"] for d in _countries(client)["destinations"]] == ["UK"]
+
+    resp = client.patch("/admin/documents/2/verified", headers={"x-api-key": ADMIN_API_KEY}, json={"verified": True})
+    assert resp.status_code == 200
+
+    assert [d["code"] for d in _countries(client)["destinations"]] == ["DE", "UK"]
+
+
+def _seed_country_rows(fake_db):
+    for i, (country, verified) in enumerate(
+        [("UK", True), ("DE", True), ("FR", True), ("EU", True), ("AE", True),
+         ("US", True), ("CN", True), (None, True), ("DE", False), ("EU", False)],
+        start=1,
+    ):
+        _seed_document(fake_db, id=i, country=country, verified=verified, content=f"row {i}")
+
+
+def _search_countries(client, destination, *, admin=False, **params):
+    path = "/admin/documents/search" if admin else "/documents/search"
+    key = ADMIN_API_KEY if admin else API_KEY
+    resp = client.get(
+        path, params={"query": "test", "destination": destination, "limit": 50, **params},
+        headers={"x-api-key": key},
+    )
+    assert resp.status_code == 200, resp.text
+    return sorted((r["country"], r["id"]) for r in resp.json())
+
+
+def test_search_eu_member_destination_includes_eu_rows(client, fake_db, mock_embeddings):
+    _seed_country_rows(fake_db)
+    assert _search_countries(client, "DE") == [("DE", 2), ("EU", 4)]
+    assert _search_countries(client, "FR") == [("EU", 4), ("FR", 3)]
+
+
+def test_search_non_eu_destinations_exclude_eu_rows(client, fake_db, mock_embeddings):
+    _seed_country_rows(fake_db)
+    assert _search_countries(client, "UK") == [("UK", 1)]
+    assert _search_countries(client, "AE") == [("AE", 5)]
+    assert _search_countries(client, "US") == [("US", 6)]
+    assert _search_countries(client, "CN") == [("CN", 7)]
+
+
+def test_search_returns_title_and_country(client, fake_db, mock_embeddings):
+    _seed_document(fake_db, id=1, country="DE", title="German rule", verified=True)
+    body = client.get(
+        "/documents/search", params={"query": "test", "destination": "DE"}, headers={"x-api-key": API_KEY}
+    ).json()
+    assert body[0]["title"] == "German rule"
+    assert body[0]["country"] == "DE"
+
+
+def test_search_requires_destination(client, fake_db, mock_embeddings):
+    resp = client.get("/documents/search", params={"query": "test"}, headers={"x-api-key": API_KEY})
+    assert resp.status_code == 422
+    mock_embeddings.assert_not_called()
+
+
+def test_search_rejects_unknown_codes(client, fake_db, mock_embeddings):
+    for params in ({"destination": "XX"}, {"destination": "EU"}, {"destination": "de"},
+                   {"destination": "DE", "origin": "BE"}):
+        resp = client.get(
+            "/documents/search", params={"query": "test", **params}, headers={"x-api-key": API_KEY}
+        )
+        assert resp.status_code == 422, params
+    mock_embeddings.assert_not_called()
+
+
+def test_search_origin_defaults_to_nl_and_accepts_nl(client, fake_db, mock_embeddings):
+    _seed_country_rows(fake_db)
+    assert _search_countries(client, "UK", origin="NL") == _search_countries(client, "UK")
+
+
+def test_admin_search_destination_filter_includes_unverified_but_not_null(client, fake_db, mock_embeddings):
+    _seed_country_rows(fake_db)
+    assert _search_countries(client, "DE", admin=True) == [("DE", 2), ("DE", 9), ("EU", 4), ("EU", 10)]
+
+
+def test_admin_search_without_destination_stays_unfiltered(client, fake_db, mock_embeddings):
+    _seed_country_rows(fake_db)
+    resp = client.get(
+        "/admin/documents/search", params={"query": "test", "limit": 50}, headers={"x-api-key": ADMIN_API_KEY}
+    )
+    assert len(resp.json()) == 10
+    resp = client.get("/admin/documents", headers={"x-api-key": ADMIN_API_KEY})
+    assert len(resp.json()) == 10

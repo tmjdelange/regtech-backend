@@ -7,6 +7,7 @@ from fastapi import FastAPI, Depends, File, HTTPException, Response, UploadFile
 from sqlalchemy.orm import Session
 
 import checklist
+import countries
 from database import get_db
 from embeddings import embedding_text, get_embedding
 from models import Document
@@ -21,6 +22,9 @@ from schemas import (
     VerifiedUpdate,
     ChecklistProfile,
     ChecklistResponse,
+    CountriesResponse,
+    DestinationCode,
+    OriginCode,
 )
 from auth import verify_api_key, verify_admin_key
 
@@ -28,17 +32,28 @@ app = FastAPI()
 
 DEFAULT_MAX_DISTANCE = 0.7
 
-with (Path(__file__).parent / "rules" / "uk_beverages.json").open(encoding="utf-8") as f:
-    CHECKLIST_RULES = json.load(f)
-
-_CHECKLIST_SOURCE_TITLES = sorted(
-    {title for rule in CHECKLIST_RULES["rules"] for title in rule["sources"]}
-)
+_RULES_DIR = Path(__file__).parent / "rules"
 
 
-def _fetch_checklist_documents(db: Session) -> dict:
+def _load_checklist_rules() -> dict:
+    """One rules file per destination, named rules/<code>_beverages.json."""
+    rules = {}
+    for code in countries.DESTINATIONS:
+        path = _RULES_DIR / f"{code.lower()}_beverages.json"
+        if path.exists():
+            with path.open(encoding="utf-8") as f:
+                rules[code] = json.load(f)
+    return rules
+
+
+CHECKLIST_RULES_BY_DESTINATION = _load_checklist_rules()
+CHECKLIST_RULES = CHECKLIST_RULES_BY_DESTINATION["UK"]
+
+
+def _fetch_checklist_documents(db: Session, rules: dict) -> dict:
+    titles = sorted({title for rule in rules["rules"] for title in rule["sources"]})
     documents = {}
-    for title in _CHECKLIST_SOURCE_TITLES:
+    for title in titles:
         row = db.query(Document).filter(Document.title == title).first()
         if row is not None:
             documents[title] = {
@@ -72,11 +87,39 @@ def create_document(doc: DocumentCreate, db: Session = Depends(get_db)):
     return db_doc
 
 
+@app.get("/countries", response_model=CountriesResponse, dependencies=[Depends(verify_api_key)])
+def list_countries(db: Session = Depends(get_db)):
+    # Counted live, so a destination appears as soon as one of its rows is
+    # verified. EU rows are shared rows, not a market, so they never count.
+    counts = {}
+    for row in db.query(Document.country).filter(Document.verified == True).all():
+        if row.country in countries.DESTINATIONS:
+            counts[row.country] = counts.get(row.country, 0) + 1
+    return {
+        "origins": [
+            {"code": code, "name": name, "default": code == countries.DEFAULT_ORIGIN}
+            for code, name in countries.ORIGINS.items()
+        ],
+        "destinations": [
+            {
+                "code": code,
+                "name": countries.DESTINATIONS[code],
+                "document_count": count,
+                "checklist_available": code in CHECKLIST_RULES_BY_DESTINATION,
+                "eu_member": code in countries.EU_MEMBER_STATES,
+            }
+            for code, count in sorted(counts.items(), key=lambda item: countries.DESTINATIONS[item[0]])
+        ],
+    }
+
+
 @app.get("/documents/search", response_model=list[SearchResult], dependencies=[Depends(verify_api_key)])
 def search_documents(
     query: str,
+    destination: DestinationCode,
+    # Validated but not used for filtering: there is no origin-side data yet.
+    origin: OriginCode = countries.DEFAULT_ORIGIN,
     limit: int = 5,
-    country: str | None = None,
     category: str | None = None,
     max_distance: float = DEFAULT_MAX_DISTANCE,
     db: Session = Depends(get_db),
@@ -85,17 +128,19 @@ def search_documents(
     distance = Document.embedding.cosine_distance(query_embedding)
     q = db.query(
         Document.id,
+        Document.title,
+        Document.country,
         Document.content,
         distance.label("distance"),
     ).filter(Document.verified == True)
-    if country is not None:
-        q = q.filter(Document.country == country)
+    # IN excludes rows with a null country, which stay visible to admins.
+    q = q.filter(Document.country.in_(countries.search_countries(destination)))
     if category is not None:
         q = q.filter(Document.category == category)
     q = q.filter(distance <= max_distance)
     results = q.order_by("distance").limit(limit).all()
     return [
-        SearchResult(id=r.id, content=r.content, distance=r.distance)
+        SearchResult(id=r.id, title=r.title, country=r.country, content=r.content, distance=r.distance)
         for r in results
     ]
 
@@ -242,6 +287,7 @@ def admin_search_documents(
     query: str,
     limit: int = 5,
     country: str | None = None,
+    destination: DestinationCode | None = None,
     category: str | None = None,
     verified: bool | None = None,
     max_distance: float | None = None,
@@ -251,12 +297,17 @@ def admin_search_documents(
     distance = Document.embedding.cosine_distance(query_embedding)
     q = db.query(
         Document.id,
+        Document.title,
+        Document.country,
         Document.content,
         Document.verified,
         distance.label("distance"),
     )
     if country is not None:
         q = q.filter(Document.country == country)
+    # Same country scoping as public search, so the two views compare like for like.
+    if destination is not None:
+        q = q.filter(Document.country.in_(countries.search_countries(destination)))
     if category is not None:
         q = q.filter(Document.category == category)
     if verified is not None:
@@ -266,7 +317,10 @@ def admin_search_documents(
         q = q.filter(distance <= max_distance)
     results = q.order_by("distance").limit(limit).all()
     return [
-        AdminSearchResult(id=r.id, content=r.content, distance=r.distance, verified=r.verified)
+        AdminSearchResult(
+            id=r.id, title=r.title, country=r.country, content=r.content,
+            distance=r.distance, verified=r.verified,
+        )
         for r in results
     ]
 
@@ -344,19 +398,39 @@ def delete_document(document_id: int, db: Session = Depends(get_db)):
     return Response(status_code=204)
 
 
-@app.post("/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_api_key)])
-def evaluate_checklist(profile: ChecklistProfile, db: Session = Depends(get_db)):
+def _evaluate_checklist(profile, destination, origin, db, *, include_unverified):
+    route = {"origin": origin, "destination": destination}
+    rules = CHECKLIST_RULES_BY_DESTINATION.get(destination)
+    if rules is None:
+        # Never fall back to another destination's rules.
+        return {
+            **route,
+            "checklist_available": False,
+            "message": "Checklist not available for this destination yet. You can still search the requirements.",
+        }
     profile_dict = profile.model_dump()
-    if checklist.is_out_of_scope(CHECKLIST_RULES, profile_dict):
-        return checklist.out_of_scope_response(CHECKLIST_RULES)
-    documents = _fetch_checklist_documents(db)
-    return checklist.evaluate(CHECKLIST_RULES, profile_dict, documents, include_unverified=False)
+    if checklist.is_out_of_scope(rules, profile_dict):
+        return {**route, **checklist.out_of_scope_response(rules)}
+    documents = _fetch_checklist_documents(db, rules)
+    result = checklist.evaluate(rules, profile_dict, documents, include_unverified=include_unverified)
+    return {**route, **result}
+
+
+@app.post("/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_api_key)])
+def evaluate_checklist(
+    profile: ChecklistProfile,
+    destination: DestinationCode,
+    origin: OriginCode = countries.DEFAULT_ORIGIN,
+    db: Session = Depends(get_db),
+):
+    return _evaluate_checklist(profile, destination, origin, db, include_unverified=False)
 
 
 @app.post("/admin/checklist/evaluate", response_model=ChecklistResponse, dependencies=[Depends(verify_admin_key)])
-def evaluate_checklist_admin(profile: ChecklistProfile, db: Session = Depends(get_db)):
-    profile_dict = profile.model_dump()
-    if checklist.is_out_of_scope(CHECKLIST_RULES, profile_dict):
-        return checklist.out_of_scope_response(CHECKLIST_RULES)
-    documents = _fetch_checklist_documents(db)
-    return checklist.evaluate(CHECKLIST_RULES, profile_dict, documents, include_unverified=True)
+def evaluate_checklist_admin(
+    profile: ChecklistProfile,
+    destination: DestinationCode,
+    origin: OriginCode = countries.DEFAULT_ORIGIN,
+    db: Session = Depends(get_db),
+):
+    return _evaluate_checklist(profile, destination, origin, db, include_unverified=True)
