@@ -7,10 +7,10 @@
     {
       "id": "sdil",
       "sources": [
-        "Soft Drinks Industry Levy — scope and rates",
+        "Soft Drinks Industry Levy (SDIL) — scope and rates",
         "Soft Drinks Industry Levy — small producer exemption"
       ],
-      "primary_source": "Soft Drinks Industry Levy — scope and rates",
+      "primary_source": "Soft Drinks Industry Levy (SDIL) — scope and rates",
       "thresholds": {
         "lower_band_min_g_per_100ml": 5,
         "higher_band_min_g_per_100ml": 8

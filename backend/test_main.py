@@ -525,7 +525,10 @@ def test_bulk_upload_embeds_title_and_content(client, fake_db, mock_embeddings):
 
 # --- Checklist: rules/uk_beverages.json + checklist.py ---
 
-SDIL_SCOPE_TITLE = "Soft Drinks Industry Levy — scope and rates"
+# Exact titles of the source documents in the production database, copied
+# from there, not from the rules file - otherwise a typo in both places
+# passes the title-match test below while the live rule is never assessed.
+SDIL_SCOPE_TITLE = "Soft Drinks Industry Levy (SDIL) — scope and rates"
 SDIL_EXEMPTION_TITLE = "Soft Drinks Industry Levy — small producer exemption"
 FBO_TITLE = "UK Food Business Operator (FBO) address requirement"
 EORI_TITLE = "EORI number required to import into the UK"
@@ -811,9 +814,12 @@ def test_checklist_rules_file_source_titles_match_seeded_documents():
     # Titles are matched exactly, so a typo or a different dash in either
     # place silently turns a rule into not_assessed.
     seeded = set(ALL_CHECKLIST_TITLES)
+    cited = set()
     for rule in CHECKLIST_RULES["rules"]:
         for title in [*rule["sources"], rule["primary_source"]]:
             assert title in seeded, f"rule {rule['id']!r} cites unknown title {title!r}"
+            cited.add(title)
+    assert seeded == cited, f"seeded titles no rule cites: {sorted(seeded - cited)}"
 
 
 def test_checklist_rule_skipped_when_source_unverified_public_vs_admin(client, fake_db):
