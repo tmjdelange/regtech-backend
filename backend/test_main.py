@@ -5,6 +5,7 @@ import pytest
 
 from conftest import ADMIN_API_KEY, API_KEY, DEFAULT_EMBEDDING
 from embeddings import embedding_text
+from main import CHECKLIST_RULES
 from models import Document
 
 # Unit vectors chosen so cosine distance from DEFAULT_EMBEDDING (the query
@@ -806,41 +807,84 @@ def test_checklist_headline_never_contains_forbidden_words(client, fake_db):
             assert forbidden not in headline
 
 
+def test_checklist_rules_file_source_titles_match_seeded_documents():
+    # Titles are matched exactly, so a typo or a different dash in either
+    # place silently turns a rule into not_assessed.
+    seeded = set(ALL_CHECKLIST_TITLES)
+    for rule in CHECKLIST_RULES["rules"]:
+        for title in [*rule["sources"], rule["primary_source"]]:
+            assert title in seeded, f"rule {rule['id']!r} cites unknown title {title!r}"
+
+
 def test_checklist_rule_skipped_when_source_unverified_public_vs_admin(client, fake_db):
     _seed_checklist_documents(fake_db, unverified_titles=[EORI_TITLE])
     profile = _checklist_profile(importer_has_eori="no")
 
     public_resp = _evaluate_checklist(client, profile, admin=False)
     public_ids = _items_by_id(public_resp.json())
-    assert "eori" not in public_ids
+    assert public_ids["eori"]["status"] == "not_assessed"
+    assert public_ids["eori"]["not_assessed_reason"] == "source_unverified"
     # the other rules, with verified sources, still come through
-    assert "fbo" in public_ids
+    assert public_ids["fbo"]["status"] == "action_needed"
 
     admin_resp = _evaluate_checklist(client, profile, admin=True)
     admin_ids = _items_by_id(admin_resp.json())
-    assert "eori" in admin_ids
+    assert admin_ids["eori"]["status"] == "action_needed"
     assert admin_ids["eori"]["reviewed"] is False
     assert admin_ids["fbo"]["reviewed"] is True
 
 
-def test_checklist_rule_skipped_entirely_when_source_document_missing(client, fake_db):
-    # Not just unverified - never uploaded at all. Must be skipped even by
-    # the admin endpoint, since there's no excerpt/url to show for it.
+def test_checklist_skipped_rule_appears_as_not_assessed(client, fake_db):
+    _seed_checklist_documents(fake_db, unverified_titles=[EORI_TITLE])
+    resp = _evaluate_checklist(client, _checklist_profile())
+    body = resp.json()
+
+    eori = _items_by_id(body)["eori"]
+    assert eori["status"] == "not_assessed"
+    assert eori["title"] == EORI_TITLE
+    assert eori["action"] == "Not assessed: the source entry is awaiting review."
+    # nothing from the unreviewed document reaches the public report
+    assert eori["source_url"] is None
+    assert eori["source_excerpt"] == ""
+
+    assert body["counts"]["not_assessed"] == 1
+    assert body["checks_total"] == len(CHECKLIST_RULES["rules"])
+    assert body["checks_assessed"] == body["checks_total"] - 1
+    assert body["items"][-1]["id"] == "eori"
+
+
+def test_checklist_rule_not_assessed_when_source_document_missing(client, fake_db):
+    # Not just unverified - never uploaded, or its title doesn't match. The
+    # admin endpoint can't evaluate it either, and says which title is missing
+    # so it isn't confused with an entry that is merely awaiting review.
     _seed_checklist_documents(fake_db, skip_titles=[EORI_TITLE])
     profile = _checklist_profile()
 
-    for admin in (False, True):
-        resp = _evaluate_checklist(client, profile, admin=admin)
-        assert "eori" not in _items_by_id(resp.json())
+    public = _items_by_id(_evaluate_checklist(client, profile).json())["eori"]
+    assert public["status"] == "not_assessed"
+    assert public["not_assessed_reason"] == "source_missing"
+    assert public["action"] == "Not assessed: the source entry is awaiting review."
+
+    admin = _items_by_id(_evaluate_checklist(client, profile, admin=True).json())["eori"]
+    assert admin["status"] == "not_assessed"
+    assert admin["not_assessed_reason"] == "source_missing"
+    assert f'"{EORI_TITLE}"' in admin["action"]
+    assert "title mismatch" in admin["action"]
 
 
-def test_checklist_sdil_skipped_when_one_of_two_sources_missing(client, fake_db):
+def test_checklist_sdil_not_assessed_when_one_of_two_sources_missing(client, fake_db):
     _seed_checklist_documents(fake_db, skip_titles=[SDIL_EXEMPTION_TITLE])
     profile = _checklist_profile(added_sugar_g_per_100ml=6.0)
 
     for admin in (False, True):
         resp = _evaluate_checklist(client, profile, admin=admin)
-        assert "sdil" not in _items_by_id(resp.json())
+        sdil = _items_by_id(resp.json())["sdil"]
+        assert sdil["status"] == "not_assessed"
+        assert sdil["not_assessed_reason"] == "source_missing"
+
+    admin_sdil = _items_by_id(_evaluate_checklist(client, profile, admin=True).json())["sdil"]
+    assert SDIL_EXEMPTION_TITLE in admin_sdil["action"]
+    assert SDIL_SCOPE_TITLE not in admin_sdil["action"]
 
 
 def test_checklist_items_ordered_action_needed_confirm_covered_not_applicable(
@@ -860,7 +904,7 @@ def test_checklist_items_ordered_action_needed_confirm_covered_not_applicable(
         ),
     )
     statuses = [item["status"] for item in resp.json()["items"]]
-    order = {"action_needed": 0, "confirm": 1, "covered": 2, "not_applicable": 3}
+    order = {"action_needed": 0, "confirm": 1, "covered": 2, "not_applicable": 3, "not_assessed": 4}
     assert statuses == sorted(statuses, key=lambda s: order[s])
 
 
@@ -882,8 +926,10 @@ def test_checklist_scenario_from_brief(client, fake_db):
 
     assert body["headline"] == (
         "Based on your answers: 3 actions needed, 2 points to confirm, "
-        "in the 1 checks covered."
+        "in the 6 checks assessed."
     )
+    assert body["checks_assessed"] == 6
+    assert body["checks_total"] == 6
 
     items = _items_by_id(body)
     assert items["fbo"]["status"] == "action_needed"

@@ -11,8 +11,17 @@ ACTION_NEEDED = "action_needed"
 CONFIRM = "confirm"
 COVERED = "covered"
 NOT_APPLICABLE = "not_applicable"
+NOT_ASSESSED = "not_assessed"
 
-_STATUS_ORDER = {ACTION_NEEDED: 0, CONFIRM: 1, COVERED: 2, NOT_APPLICABLE: 3}
+_STATUS_ORDER = {ACTION_NEEDED: 0, CONFIRM: 1, COVERED: 2, NOT_APPLICABLE: 3, NOT_ASSESSED: 4}
+
+# Why a rule came back as not_assessed. The public endpoint shows the same
+# wording for both, but the admin endpoint keeps them apart so a title that
+# doesn't match any document isn't mistaken for one that is just unreviewed.
+SOURCE_MISSING = "source_missing"
+SOURCE_UNVERIFIED = "source_unverified"
+
+_AWAITING_REVIEW_TEXT = "Not assessed: the source entry is awaiting review."
 
 _ANNUAL_VOLUME_DESCRIPTIONS = {
     "under_1m": "under 1 million litres",
@@ -117,16 +126,44 @@ def out_of_scope_response(config):
     return {"message": config["scope_stop_message"]}
 
 
+def _not_assessed_item(rule, documents, reason, *, include_unverified):
+    if include_unverified and reason == SOURCE_MISSING:
+        missing = [title for title in rule["sources"] if title not in documents]
+        action = (
+            "Not assessed: no document has the exact title "
+            + ", ".join(f'"{title}"' for title in missing)
+            + ". Check for a title mismatch or upload the missing source."
+        )
+    else:
+        action = _AWAITING_REVIEW_TEXT
+
+    # No URL or excerpt: an unreviewed document mustn't leak into the report.
+    return {
+        "id": rule["id"],
+        "title": rule["primary_source"],
+        "status": NOT_ASSESSED,
+        "action": action,
+        "source_url": None,
+        "source_excerpt": "",
+        "reviewed": False,
+        "not_assessed_reason": reason,
+    }
+
+
 def evaluate(config, profile, documents, *, include_unverified):
     """Evaluate every rule in `config["rules"]` against `profile`.
 
     `documents` maps an exact document title to
-    {"source_url": ..., "content": ..., "verified": ...}. A rule is skipped
-    entirely if any document it cites is missing from this dict. Otherwise,
+    {"source_url": ..., "content": ..., "verified": ...}. A rule is not
+    evaluated if any document it cites is missing from this dict. Otherwise,
     when `include_unverified` is False (the public endpoint), the rule is
-    also skipped unless every cited document is verified; when True (the
-    admin endpoint), it's included regardless, with `reviewed` reflecting
-    whether every cited document was in fact verified.
+    also not evaluated unless every cited document is verified; when True
+    (the admin endpoint), it's evaluated regardless, with `reviewed`
+    reflecting whether every cited document was in fact verified.
+
+    A rule that isn't evaluated still gets an item, with status
+    not_assessed and `not_assessed_reason` saying why, so the report never
+    silently drops a check.
 
     Caller is expected to have already checked `is_out_of_scope`.
     """
@@ -135,10 +172,20 @@ def evaluate(config, profile, documents, *, include_unverified):
     for rule in config["rules"]:
         sources = rule["sources"]
         if any(title not in documents for title in sources):
+            items.append(
+                _not_assessed_item(
+                    rule, documents, SOURCE_MISSING, include_unverified=include_unverified
+                )
+            )
             continue
 
         all_verified = all(documents[title]["verified"] for title in sources)
         if not include_unverified and not all_verified:
+            items.append(
+                _not_assessed_item(
+                    rule, documents, SOURCE_UNVERIFIED, include_unverified=include_unverified
+                )
+            )
             continue
 
         status, action = _EVALUATORS[rule["id"]](rule, profile)
@@ -153,26 +200,28 @@ def evaluate(config, profile, documents, *, include_unverified):
                 "source_url": primary_doc["source_url"],
                 "source_excerpt": primary_doc["content"],
                 "reviewed": all_verified,
+                "not_assessed_reason": None,
             }
         )
 
     items.sort(key=lambda item: _STATUS_ORDER[item["status"]])
 
-    counts = {status: 0 for status in (ACTION_NEEDED, CONFIRM, COVERED, NOT_APPLICABLE)}
+    counts = {status: 0 for status in _STATUS_ORDER}
     for item in items:
         counts[item["status"]] += 1
 
+    checks_assessed = len(items) - counts[NOT_ASSESSED]
     headline = (
         f"Based on your answers: {counts[ACTION_NEEDED]} actions needed, "
-        f"{counts[CONFIRM]} points to confirm, in the {counts[COVERED]} checks covered."
+        f"{counts[CONFIRM]} points to confirm, in the {checks_assessed} checks assessed."
     )
 
     return {
         "headline": headline,
         "counts": counts,
         "items": items,
-        "checks_covered": counts[COVERED],
-        "checks_total": len(items),
+        "checks_assessed": checks_assessed,
+        "checks_total": len(config["rules"]),
         "scope": config["scope_description"],
         "disclaimer": config["disclaimer"],
     }

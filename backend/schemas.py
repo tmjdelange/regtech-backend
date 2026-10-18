@@ -76,23 +76,25 @@ class ChecklistProfile(BaseModel):
 class ChecklistItem(BaseModel):
     id: str
     title: str
-    status: Literal["action_needed", "confirm", "covered", "not_applicable"]
+    status: Literal["action_needed", "confirm", "covered", "not_applicable", "not_assessed"]
     action: str
     source_url: Optional[str] = None
     source_excerpt: str
     reviewed: bool
+    not_assessed_reason: Optional[Literal["source_missing", "source_unverified"]] = None
 
 class ChecklistCounts(BaseModel):
     action_needed: int
     confirm: int
     covered: int
     not_applicable: int
+    not_assessed: int
 
 class ChecklistResult(BaseModel):
     headline: str
     counts: ChecklistCounts
     items: List[ChecklistItem]
-    checks_covered: int
+    checks_assessed: int
     checks_total: int
     scope: str
     disclaimer: str
