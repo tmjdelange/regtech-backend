@@ -3,11 +3,13 @@ import io
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, Depends, File, HTTPException, Response, UploadFile
+from fastapi import FastAPI, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 import checklist
 import countries
+import extraction
 from database import get_db
 from embeddings import embedding_text, get_embedding
 from models import Document
@@ -25,6 +27,7 @@ from schemas import (
     CountriesResponse,
     DestinationCode,
     OriginCode,
+    ExtractionResponse,
 )
 from auth import verify_api_key, verify_admin_key
 
@@ -434,3 +437,37 @@ def evaluate_checklist_admin(
     db: Session = Depends(get_db),
 ):
     return _evaluate_checklist(profile, destination, origin, db, include_unverified=True)
+
+
+def _client_ip(request: Request) -> str:
+    # Requests arrive through the frontend's server-side proxy, which passes
+    # the visitor's address on. Only callers holding the API key get here, so
+    # the header is trusted.
+    forwarded = request.headers.get("x-client-ip", "").strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "unknown"
+
+
+# Multipart is parsed by hand rather than with UploadFile parameters:
+# Starlette writes uploads over 1MB to a temp file, and these must stay in
+# memory. See extraction.py.
+@app.post("/extract", response_model=ExtractionResponse, dependencies=[Depends(verify_api_key)])
+async def extract_from_documents(request: Request):
+    try:
+        if not extraction.is_configured():
+            raise extraction.ExtractionError(503, "Extraction is not available right now")
+        uploads = await extraction.read_uploads(request.headers.get("content-type", ""), request.stream())
+        content, report_text = await run_in_threadpool(extraction.build_content, uploads)
+        refused = extraction.rate_limiter.acquire(_client_ip(request))
+        if refused:
+            raise extraction.ExtractionError(429, refused)
+        raw = await extraction.call_model(content)
+        return extraction.apply_rules(
+            raw,
+            has_label=any(u.field == "label" for u in uploads),
+            has_report=any(u.field == "lab_report" for u in uploads),
+            report_text=report_text,
+        )
+    except extraction.ExtractionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)

@@ -8,3 +8,7 @@ openai
 python-multipart
 pytest
 httpx
+anthropic
+pdfplumber
+pypdfium2
+pillow

@@ -135,3 +135,45 @@ class ChecklistUnavailable(ChecklistRoute):
     message: str
 
 ChecklistResponse = Union[ChecklistResult, ChecklistOutOfScope, ChecklistUnavailable]
+
+Confidence = Literal["high", "medium", "low"]
+
+class ExtractedNumberSource(BaseModel):
+    value: float
+    source: Literal["label", "lab_report"]
+    quote: str
+    confidence: Confidence
+    original_text: str
+    converted_from_unit: Optional[str] = None
+
+class ExtractedNumber(BaseModel):
+    """The value to pre-fill (the lab report's when both documents give one),
+    plus what each document said. All null when not found."""
+    value: Optional[float] = None
+    source: Optional[Literal["label", "lab_report"]] = None
+    quote: Optional[str] = None
+    confidence: Optional[Confidence] = None
+    original_text: Optional[str] = None
+    converted_from_unit: Optional[str] = None
+    label: Optional[ExtractedNumberSource] = None
+    lab_report: Optional[ExtractedNumberSource] = None
+
+class ExtractedAbv(ExtractedNumber):
+    conflict: bool
+
+class ExtractedLabelCheck(BaseModel):
+    value: Literal["yes", "not_found"]
+    source: Optional[Literal["label"]] = None
+    quote: Optional[str] = None
+    confidence: Optional[Confidence] = None
+
+class ExtractedLabelCheckUnclear(ExtractedLabelCheck):
+    value: Literal["yes", "not_found", "unclear"]
+
+class ExtractionResponse(BaseModel):
+    abv_percent: ExtractedAbv
+    total_sugars_g_per_100ml: ExtractedNumber
+    label_uk_fbo_address: ExtractedLabelCheck
+    label_product_name_english: ExtractedLabelCheck
+    label_ingredients_with_allergens_highlighted: ExtractedLabelCheckUnclear
+    label_country_of_origin: ExtractedLabelCheck
